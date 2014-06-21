@@ -20,9 +20,6 @@ void loran_info(struct lc_chain *chain)
 		       "\tPassed FRIs: %u\n",
 		       i, chain->sta[i].offset, chain->sta[i].comb_kp,
 		       chain->sta[i].fris_passed);
-		for(size_t j = 0; j < LC_GRCNT*LC_STA_GRIWCNT; ++j)
-			printf("\tWindow %u offset %u\n",
-			       j, chain->sta[i].wnd[j].offset);
 	}
 }
 

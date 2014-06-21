@@ -50,16 +50,14 @@ void lc_init(struct lc_chain *chain)
 
 		sta->comb_kp = 5;
 
-		for(size_t j = 0; j < LC_GRCNT; ++j)
-			for(size_t k = 0; k < LC_STA_GRIWCNT; ++k) {
-				size_t w = k + j * LC_STA_GRIWCNT;
-				sta->wnd[w].offset = k * LC_STA_WININT;
-				sta->wnd[w].offset+= j * chain->grin;
-
-				sta->wnd[w].dcrem_buf = 0;
-				memset(sta->wnd[w].data, 0,
-				       LC_STA_WINSZ * sizeof(lc_type_data_s));
-			}
+		for(size_t j = 0; j < LC_PC_CNT; ++j) {
+			memset(sta->xcorr_tmp[j], 0,
+			       LC_STA_WINSZ * sizeof(lc_type_data_s));
+			memset(sta->xcorr_pc[j], 0,
+			       LC_STA_WINSZ * sizeof(lc_type_comb_s));
+		}
+		memset(sta->win0, 0,
+		       LC_STA_WINSZ * sizeof(lc_type_comb_s));
 	}
 
 	printf("------------------------\n"
@@ -306,17 +304,44 @@ static void lc_start_seek(struct lc_chain *chain)
 
 		sta->seek_cur_int = &sta->seek_ints[0];
 		sta->seek_complete = 0;
-		sta->comb_kp = 7;	/* Default SEEK value */
+		sta->comb_kp = 8;	/* Default SEEK value */
 		sta->offset = sta->seek_cur_int->begin;
 
 		sta->fris_passed = 0;
 		sta->last_gri_idx = 0;
-		sta->ssr_call_period = lc_comb_delay[sta->comb_kp + 1];
+		sta->ssr_call_period = lc_comb_delay[sta->comb_kp];
+
+		sta->lock_enabled = 0;
 
 		sta->state = LC_STAST_SEEK;
 
 		chain->seek_sta_cnt++;
 	}
+}
+
+
+static void lc_sta_service_locking(struct lc_chain *chain, struct lc_station *sta)
+{
+	char	fname[128];
+
+	snprintf(fname, 127, "data_%u_sta_%d_xc.txt",
+		 chain->gri, sta - chain->sta);
+
+	FILE* dfile = fopen(fname, "ab");
+	if(!dfile) {
+		perror("fopen() while writing windows contents");
+		return;
+	}
+	for(size_t j = 0; j < LC_STA_WINSZ; ++j)
+		fprintf(dfile, "%d ", (sta->xcorr_pc[sta->lock_pc][j] >> LC_BITS_COMBF));
+	fputs("\n", dfile);
+
+//	for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
+//		for(size_t j = 0; j < LC_STA_WINSZ; ++j)
+//			fprintf(dfile, "%d ", sta->xcorr_pc[pc][j] >> LC_BITS_COMBF);
+//		fputs("\n", dfile);
+//	}
+	fclose(dfile);
 }
 
 /*
@@ -326,7 +351,6 @@ static void lc_start_seek(struct lc_chain *chain)
  *  If no more seek intervals are available, sets "seek_complete" flag and
  *  changes state to "IDLE"
  */
-
 static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 {
 	assert(sta->state == LC_STAST_SEEK);
@@ -349,7 +373,7 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 			sta->state = LC_STAST_IDLE;
 			sta->ssr_call_period = 0;
 
-			printf("#SEEK# STA %u completed seek\n",
+			printf("#SEEK# STA %d completed seek\n",
 			       sta - chain->sta);
 			chain->seek_sta_cnt--;
 			if(!chain->seek_sta_cnt) {
@@ -358,6 +382,17 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 				 * moment
 				 */
 				printf("#SEEK# COMPLETED!\n");
+			}
+
+			if(sta->lock_enabled) {
+				if(sta->lock_point < LC_STA_WINSHIFT)
+					sta->offset = sta->lock_point + chain->grin - LC_STA_WINSHIFT;
+				else
+					sta->offset = sta->lock_point - LC_STA_WINSHIFT;
+				sta->ssr_call_period = 1;
+				sta->state = LC_STAST_LOCKING;
+				printf("#LOCK# STA %d locking at %u\n",
+				       sta - chain->sta, sta->offset);
 			}
 
 			return;
@@ -385,6 +420,29 @@ static void lc_sta_service(struct lc_chain *chain, struct lc_station *sta)
 		break;
 	case LC_STAST_BUSY:
 		break;
+	case LC_STAST_LOCKING:
+		lc_sta_service_locking(chain, sta);
+		break;
+	}
+}
+
+static void lc_sta_xcorr_tmp_filter(struct lc_station *sta)
+{
+	for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
+		lc_type_data_s	*src, *src_end;
+		lc_type_comb_s	*dst;
+
+		src = sta->xcorr_tmp[pc];
+		src_end = sta->xcorr_tmp[pc] + LC_STA_WINSZ;
+		dst = sta->xcorr_pc[pc];
+
+		while(src < src_end) {
+			lc_type_comb_s cs = (lc_type_comb_s) *src << LC_BITS_COMBF;
+			cs = cs / (int) LC_STA_WINCNT;
+			cs = (*dst * ((1 << sta->comb_kp) - 1) + cs) / (1 << sta->comb_kp);
+			*dst++ = cs;
+			*src++ = 0;	/* Filling xcorr_tmp with zeros */
+		}
 	}
 }
 
@@ -397,18 +455,17 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 			       size_t data_offset,
 			       lc_type_sample *data, size_t count)
 {
-	struct lc_subwin *win;
-	lc_type_data_s	*wptr;
-	lc_type_sample	*data_end;
+	lc_type_comb_s		*wptr;
+	lc_type_sample		*data_end;
 
-	assert(win_idx < LC_GRCNT * LC_STA_GRIWCNT);
+	assert(win_idx < LC_STA_WINCNT);
 	assert(data_offset < LC_STA_WINSZ);
 
-	win = &sta->wnd[win_idx];
-	wptr = win->data + data_offset;
+	//win = &sta->wnd[win_idx];
+	wptr = sta->win0 + data_offset;
 	data_end = data + count;
 
-	lc_type_sample	sd = win->dcrem_buf;
+	lc_type_sample	sd = sta->dcrem_buf;
 	while(data < data_end) {
 		lc_type_sample	s = *data++;		/* Take sample */
 		lc_type_data_s	ss;			/* DC notch output */
@@ -419,14 +476,35 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 							   sample */
 		sd = s;					/* Write to delay buf */
 		ss-= ss >> (LC_DCREM_KP + 1);		/* Mult by 'b' */
-		/* Comb filter - integrator over FRI */
-		ss<<= LC_BITS_COMBF;			/* Convert to fixed */
 
-		//ss = ((*wptr << sta->comb_kp) - *wptr + ss) >> sta->comb_kp;
-		ss = (*wptr * ((1 << sta->comb_kp) - 1) + ss) / (1 << sta->comb_kp);
-		*wptr++ = ss;
+		/*
+		 * Now, we should do the following:
+		 * -accumulate sample to sta->xcorr_tmp windows, adding or sub-
+		 *  tracting it based on value of corresponding PC bit
+		 * -if it is window 0 (first pulse of station, first bit of PC)
+		 *  then update comb-filtered version of 1st pulse in sta->win0
+		 */
+
+		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
+			_Bool pcbit = lc_pc[pc][win_idx];
+			if(pcbit)
+				sta->xcorr_tmp[pc][data_offset] += ss;
+			else
+				sta->xcorr_tmp[pc][data_offset] -= ss;
+		}
+
+		if(win_idx == 0) {
+			/* Comb filter - integrator over FRI */
+			lc_type_comb_s cs;
+			cs = (lc_type_comb_s) ss << LC_BITS_COMBF; /* Convert to fixed */
+
+			//ss = ((*wptr << sta->comb_kp) - *wptr + ss) >> sta->comb_kp;
+			cs = (*wptr * ((1 << sta->comb_kp) - 1) + cs) / (1 << sta->comb_kp);
+			*wptr++ = cs;
+		}
+		data_offset++;
 	}
-	win->dcrem_buf = sd;
+	sta->dcrem_buf = sd;
 }
 
 /*
@@ -450,16 +528,15 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 	startw_idx = data_offset / LC_STA_WININT;
 	assert(startw_idx < LC_STA_GRIWCNT);
 
-	if(sta->offset == 33356 && 0)
-		printf("Loran station samples:\n"
-		       "\tSTA offset: %u\n"
-		       "\tData GRI index: %u\n"
-		       "\tData offset: %u\n"
-		       "\tData length: %u\n"
-		       "\tWindow begin: %u\n",
-		       sta->offset, gri_idx,
-		       data_offset,
-		       count, startw_idx + griw_base);
+//	printf("Loran station samples:\n"
+//	       "\tSTA offset: %u\n"
+//	       "\tData GRI index: %u\n"
+//	       "\tData offset: %u\n"
+//	       "\tData length: %u\n"
+//	       "\tWindow begin: %u\n",
+//	       sta->offset, gri_idx,
+//	       data_offset,
+//	       count, startw_idx + griw_base);
 
 
 	startw_offset = startw_idx * LC_STA_WININT;
@@ -469,12 +546,12 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 	data_end = data_offset + count;
 
 	for(widx = (startw_idx + griw_base);; ++widx) {
-		/*
-		printf("\tDATA for window %u\n"
-		       "\t\tStart of data: %u\n"
-		       "\t\tEnd of data: %u\n",
-		       i, data_offset, data_end);
-		       */
+
+//		printf("\tDATA for window %u\n"
+//		       "\t\tStart of data: %u\n"
+//		       "\t\tEnd of data: %u\n",
+//		       i, data_offset, data_end);
+
 		if(data_offset < LC_STA_WINSZ) {
 			size_t spansize = data_end > LC_STA_WINSZ ?
 						(LC_STA_WINSZ - data_offset):
@@ -489,10 +566,10 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 			break;
 		readcount = LC_STA_WININT - data_offset;
 
-		//printf("\tRead: %u samples\n", readcount);
+//		printf("\tRead: %u samples\n", readcount);
 
-		//if(data_end <= LC_STA_WININT)
-		//	break;
+//		if(data_end <= LC_STA_WININT)
+//			break;
 
 		data_end-= LC_STA_WININT;
 		data+= readcount;
@@ -501,10 +578,15 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 
 	sta->last_gri_idx = gri_idx;
 	/*
-	 * If station has yet filled in last window in FRI, check for this
+	 * If station has just filled in last window in FRI, check for this
 	 * and call service routine if needed
+	 *
+	 * Also, perform comb-filtering (integration) of xcorr_tmp intermediate
+	 *  PC correlation results into xcorr_pc
 	 */
 	if(widx == LC_STA_WINCNT-1 && data_end >= LC_STA_WINSZ) {
+		lc_sta_xcorr_tmp_filter(sta);
+
 		sta->fris_passed++;
 		if(sta->ssr_call_period &&
 		   sta->fris_passed >= sta->ssr_call_period) {

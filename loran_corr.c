@@ -17,14 +17,14 @@ struct lc_halfwave
 	uint16_t	begin;
 	uint16_t	end;
 	/* Magnitude of halfwave */
-	lc_type_data_u	mag;
+	lc_type_data_s	mag;
 };
 
 static struct lc_halfwave pulwinhw[LC_WIN_HWAVESCNT];
 
 /**/
-void lc_hwaves_win_gen(lc_type_var *wbuf, struct lc_halfwave *hwbuf,
-		     size_t peakidx)
+void lc_hwaves_win_gen(lc_type_comb_s *wbuf, struct lc_halfwave *hwbuf,
+		       size_t peakidx)
 {
 	/*
 	 * Go from end to beginning: probably there is more correct 100khz
@@ -40,12 +40,12 @@ void lc_hwaves_win_gen(lc_type_var *wbuf, struct lc_halfwave *hwbuf,
 		if(LC_SGN(wbuf[i]) == LC_SGN(wbuf[i - 1]))
 			continue;
 
-		lc_type_data_s hwamp = 0;
+		lc_type_comb_s hwamp = 0;
 		hwstart = i;
 		for(size_t j = hwstart; j <= hwend; ++j)
-			if(abs(wbuf[j]) > hwamp)
-				hwamp = abs(wbuf[j]);
-		hwcur->mag = hwamp;
+			if(abs(wbuf[j]) > abs(hwamp))
+				hwamp = wbuf[j];
+		hwcur->mag = hwamp >> LC_BITS_COMBF;
 		hwcur->end = hwend;
 		hwcur->begin = hwstart;
 		//printf("HWAVE %3d: %u .. %u , amp %d\n",
@@ -74,13 +74,13 @@ void lc_hwaves_match(struct lc_halfwave *hwbuf)
 		 *  in the range [0 .. 1). If this condition doesn't hold, we
 		 *  just abandon calculations and maybe raise error condition..
 		 *
-		 * As beta is always < 1, it should be stored as fractional
+		 * As |beta| is always < 1, it should be stored as fractional
 		 *  number. We've chosen fixed point format for that, with 16
 		 *  bit fraction part. So that when we multiply Vi by beta, the
 		 *  result fits into 32 bit register (given Vi is up to 16 bits
 		 *  wide).
 		 */
-		uint32_t beta;
+		int32_t beta;
 
 		/*
 		 * When calculating beta, we assume that sum(Ri^2) and
@@ -90,31 +90,31 @@ void lc_hwaves_match(struct lc_halfwave *hwbuf)
 		 *   reason. Most of the time Vi <= 2048) and REFEDGE_SZ is 15,
 		 *  these conditions are met.
 		 */
-		uint32_t sum_rivi = 0;
+		int32_t sum_rivi = 0;
 		for(size_t i = 0; i < LC_REFEDGE_SZ; ++i)
 			sum_rivi+= hwcur[i].mag * lc_refedge[i];
 
 		beta = sum_rivi / (LC_REFEDGE_CVAR >> LC_BITS_HWBETAF);
-		printf("Beta: %u.%u\t", (beta >> LC_BITS_HWBETAF),
+		printf("Beta: %d.%d\t", (beta >> LC_BITS_HWBETAF),
 		       (beta & ((1<<LC_BITS_HWBETAF) - 1)));
 
 		/*
 		 * Residual squares sum - cumulative fitting error measure
 		 * RSS = sum((beta * Ri - Vi) ^ 2)
-		 * As we can fit both sum(Ri ^ 2) and sum(Vi ^ 2) into uint32,
+		 * As we can fit both sum(Ri ^ 2) and sum(Vi ^ 2) into int32,
 		 *  this beast definitely fits there too..
 		 */
-		uint32_t rss = 0;
+		int32_t rss = 0;
 
 		for(size_t i = 0; i < LC_REFEDGE_SZ; ++i) {
-			uint32_t b_ri;
+			int32_t b_ri;
 			b_ri = beta * lc_refedge[i];
 			b_ri >>= LC_BITS_HWBETAF;	/* remove fraction */
 			int32_t psum;
 			psum = (int32_t) b_ri - (int32_t) hwcur[i].mag;
 			rss+= psum * psum;
 		}
-		printf("RSS: %u\t", rss);
+		printf("RSS: %d\t", rss);
 
 		/*
 		 * Now we need to normalize RSS in some way, so that we are
@@ -135,66 +135,42 @@ void lc_hwaves_match(struct lc_halfwave *hwbuf)
 		 * Simplifying above inequality, we can obtain following:
 		 *  beta^2 * sum(Ri ^ 2) / (thres ^ 2) > RSS
 		 */
-		uint32_t comp_lh;
+		int32_t comp_lh;
 
 		//comp_lh = (LC_HWAVE_VAL_C >> LC_BITS_HWBETAF) * beta;
 		//comp_lh = (comp_lh >> LC_BITS_HWBETAF) * beta;
 		comp_lh = ((beta * beta) >> LC_BITS_HWBETAF);
 		comp_lh*= (LC_REFEDGE_CVAR >> LC_BITS_HWBETAF);
-		printf("LH: %u\t", comp_lh);
+		printf("LH: %d\t", comp_lh);
 
-		uint32_t accuracy;
+		int32_t accuracy;
 		if(rss)
 			accuracy = comp_lh / rss;
 		else
 			accuracy = comp_lh;
 
-		printf("ACC: %u\t", accuracy);
+		printf("ACC: %d\t", accuracy);
 
-		printf("HW %d start %u end %u\n",
-		       hwcur - hwbuf, hwcur->begin, hwcur->end);
+		printf("HW %d start %u end %u mag %d\n",
+		       hwcur - hwbuf, hwcur->begin, hwcur->end, hwcur->mag);
 	}
 }
 
 void lc_corr_sta(struct lc_station *sta)
 {
-	/* Fill phase-code correlation windows with zeros */
-	for(size_t i = 0; i < LC_PC_CNT; ++i)
-		memset(sta->xcorr_pc[i], 0, LC_STA_WINSZ * sizeof(lc_type_var));
-
 	lc_type_comb_s	wmax = 0;	/* Maximum value in windows */
 
-	for(size_t i = 0; i < LC_STA_WINCNT; ++i) {
-		struct lc_subwin *win = &sta->wnd[i];
-		/*
-		 * Accumulate to corresponding phase code correlation windows
-		 * taking into account phase code bit
-		 */
-		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-			_Bool pcbit = lc_pc[pc][i];
-			if(pcbit) {
-				for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-					sta->xcorr_pc[pc][j]+= (win->data[j] >> LC_BITS_COMBF);
-			} else {
-				for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-					sta->xcorr_pc[pc][j]-= (win->data[j] >> LC_BITS_COMBF);
-			}
-		}
-		for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-			if(abs(win->data[j]) > wmax)
-				wmax = abs(win->data[j]);
-	}
+	for(size_t j = 0; j < LC_STA_WINSZ; ++j)
+		if(abs(sta->win0[j]) > wmax)
+			wmax = abs(sta->win0[j]);
 
 	wmax = wmax >> LC_BITS_COMBF;
 
-	if(wmax < 30)
+	if(wmax < 90)
 		return;
 
 	/* Find maximum among PC correlation windows */
 	for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-		for(size_t i = 0; i < LC_STA_WINSZ; ++i)
-			sta->xcorr_pc[pc][i] /= (int) LC_STA_WINCNT;
-
 		int max = abs(sta->xcorr_pc[pc][0]);
 		size_t maxidx = 0;
 		for(size_t i = 0; i < LC_STA_WINSZ; ++i) {
@@ -213,7 +189,7 @@ void lc_corr_sta(struct lc_station *sta)
 		if(maxidx < LC_WCEN_BEGIN || maxidx >= LC_WCEN_END)
 			continue;
 
-		//max = max / LC_STA_WINCNT;
+		max = max >> LC_BITS_COMBF;
 		int cnorm = (max << LC_BITS_XCNORMF) / (int) wmax;
 
 		if(cnorm > LC_XCORR_THRES) {
@@ -221,32 +197,34 @@ void lc_corr_sta(struct lc_station *sta)
 			       " AMP %d GRI offset %u (sta offset %u)\n",
 			       pc, maxidx, max, cnorm, wmax,
 			       sta->offset + maxidx, sta->offset);
-			lc_hwaves_win_gen(sta->xcorr_pc[pc], pulwinhw, maxidx);
+			lc_hwaves_win_gen(sta->win0, pulwinhw, maxidx);
 			lc_hwaves_match(pulwinhw);
+			if(!sta->lock_enabled) {
+				sta->lock_point = sta->offset + maxidx;
+				sta->lock_pc = pc;
+				sta->lock_enabled = 1;
+			}
 		}
 	}
 
 	/* Output windows content to files... */
-	if(sta->offset == 33356) {
-		char	fname[128] = "data_win_33356.txt";
+//	if(sta->offset == 33356) {
+//		char	fname[128] = "data_win_33356.txt";
 
-		FILE* dfile = fopen(fname, "wb");
-		if(!dfile) {
-			perror("fopen() while writing windows contents");
-			return;
-		}
-		for(size_t i = 0; i < LC_STA_WINCNT; ++i) {
-			struct lc_subwin *win = &sta->wnd[i];
+//		FILE* dfile = fopen(fname, "wb");
+//		if(!dfile) {
+//			perror("fopen() while writing windows contents");
+//			return;
+//		}
+//		for(size_t j = 0; j < LC_STA_WINSZ; ++j)
+//			fprintf(dfile, "%d ", (sta->win0[j] >> LC_BITS_COMBF));
+//		fputs("\n", dfile);
 
-			for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-				fprintf(dfile, "%hd ", (win->data[j] >> LC_BITS_COMBF));
-			fputs("\n", dfile);
-		}
-		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-			for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-				fprintf(dfile, "%hd ", sta->xcorr_pc[pc][j]);
-			fputs("\n", dfile);
-		}
-		fclose(dfile);
-	}
+//		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
+//			for(size_t j = 0; j < LC_STA_WINSZ; ++j)
+//				fprintf(dfile, "%d ", sta->xcorr_pc[pc][j] >> LC_BITS_COMBF);
+//			fputs("\n", dfile);
+//		}
+//		fclose(dfile);
+//	}
 }

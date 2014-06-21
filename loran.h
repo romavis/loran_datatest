@@ -93,7 +93,7 @@
 
 typedef uint16_t	lc_type_sample;
 typedef int16_t		lc_type_data_s;
-typedef int16_t		lc_type_comb_s;
+typedef int32_t		lc_type_comb_s;
 
 typedef int32_t		lc_type_var;
 /**/
@@ -207,11 +207,13 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 /*
  * Comb filter delay line (window data) actually contains fixed-point data type,
  * not integral. This is needed to overcome underflow caused by truncating P
- * least significant bits with high enough (>4-7) P values
+ * least significant bits of samples when calculating (sample >> P)
+ *
+ * We set it to P_MAX, because in this case there can't be any underflow..
  *
  * Note! LC_BITS_COMBF+LC_BITS_D should fit inside lc_type_comb_s type!
  */
-#define LC_BITS_COMBF	4
+#define LC_BITS_COMBF	LC_COMB_KP_MAX
 
 /*******************************************************************************
  * DC removing filter related
@@ -246,7 +248,7 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 #define LC_STA_WININTT	1000U					/* in uS */
 #define LC_STA_WININT	(LC_FS * LC_STA_WININTT / 1000000)	/* in samples */
 /* Single window size */
-#define LC_STA_WINSZT	320U					/* in uS */
+#define LC_STA_WINSZT	500U					/* in uS */
 #define LC_STA_WINSZ	(LC_FS * LC_STA_WINSZT / 1000000)	/* in samples */
 /* Window (station) shift step used in seek process */
 #define LC_STA_WINSHIFT	(LC_STA_WINSZ / 2)
@@ -303,12 +305,12 @@ extern _Bool		lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT];
 #define LC_STA_MAXCNT	8
 
 /* Represents single subwindow (that contains one pulse leading edge) */
-struct lc_subwin {
-	size_t		offset;
+//struct lc_subwin {
+//	size_t		offset;
 
-	lc_type_sample	dcrem_buf;
-	lc_type_comb_s	data[LC_STA_WINSZ];
-};
+//	lc_type_sample	dcrem_buf;
+//	lc_type_comb_s	data[LC_STA_WINSZ];
+//};
 
 /* Represents interval inside GRI: [begin, end). NOTE: end >= begin (always) */
 struct lc_int {
@@ -320,6 +322,7 @@ struct lc_int {
 #define LC_STAST_IDLE	0
 #define LC_STAST_SEEK	1
 #define LC_STAST_BUSY	2
+#define LC_STAST_LOCKING 3
 
 #define LC_STA_IS_BUSY(x) ((x)->state == LC_STAST_BUSY)
 #define LC_STA_IS_IDLE(x) ((x)->state == LC_STAST_IDLE)
@@ -339,10 +342,30 @@ struct lc_station {
 	/* Period (FRIs count) to call station service routine with */
 	size_t		ssr_call_period;
 
+	/* DC removal filter delay line */
+	lc_type_sample	dcrem_buf;
+
 	/* Integration windows: the "source" of station signal for processing */
-	struct lc_subwin wnd[LC_GRCNT*LC_STA_GRIWCNT];
-	/* Cross-correlation buffers - for each phase code */
-	lc_type_var	xcorr_pc[LC_PC_CNT][LC_STA_WINSZ];
+//	struct lc_subwin wnd[LC_GRCNT*LC_STA_GRIWCNT];
+	/*
+	 * Window that stores comb-filtered representation of first pulse (first
+	 *  bit of PC)
+	 */
+	lc_type_comb_s	win0[LC_STA_WINSZ];
+
+	/*
+	 * PC correlator temporary result (over one FRI) accumulation windows
+	 * These accumulate sums of samples directly from DC removal filter,
+	 *  not yet filtered with comb filter..
+	 */
+	lc_type_data_s	xcorr_tmp[LC_PC_CNT][LC_STA_WINSZ];
+
+	/*
+	 * Cross-correlation results - for each phase code
+	 * These are result of passing xcorr_tmp windows through a comb filter
+	 * during several FRIs
+	 */
+	lc_type_comb_s	xcorr_pc[LC_PC_CNT][LC_STA_WINSZ];
 
 	/* Station state */
 	int		state;
@@ -355,6 +378,11 @@ struct lc_station {
 	struct lc_int	*seek_cur_int;
 	/* Flag - set when all seek intervals are processed */
 	_Bool		seek_complete;
+
+	/*** LOCKING related ***/
+	size_t		lock_point;
+	size_t		lock_pc;
+	_Bool		lock_enabled;
 };
 
 /* Struct represents single Loran-C chain */
