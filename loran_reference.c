@@ -1,35 +1,54 @@
 #include "loran.h"
 
-//lc_type_refpulse	lc_refpulse[LC_REFPULSE_SZ] = {
-//	0	,61	,0	,-108	,0	,205	,0	,-375	,
-//	0	,545	,0	,-784	,0	,1015	,0	,-1261	,
-//	0	,1474	,0	,-1670	,0	,1842	,0	,-2012	,
-//	0	,2012	,0	,-2047
-//};
 
 /*
- * Values taken from:
- * GOST R 53168-2008: Chayka Navigation System. Transmitted signal specification
- *                    par. 3.1.1.4, page 5
+ * NOTE: Chayka edge from GOST R 53168-2008
+ *	 Loran-C from USCG Loran-C 1994 Signal Specification
  */
 
-//lc_type_data_u		lc_refedge[LC_REFEDGE_SZ] = {
-//	(0.0	* LC_REFEDGE_MAG),
-//	(0.030	* LC_REFEDGE_MAG),
-//	(0.053	* LC_REFEDGE_MAG),
-//	(0.100	* LC_REFEDGE_MAG),
-//	(0.183	* LC_REFEDGE_MAG),
-//	(0.266	* LC_REFEDGE_MAG),
-//	(0.383	* LC_REFEDGE_MAG),
-//	(0.496	* LC_REFEDGE_MAG),
-//	(0.616	* LC_REFEDGE_MAG),
-//	(0.720	* LC_REFEDGE_MAG),
-//	(0.816	* LC_REFEDGE_MAG),
-//	(0.900	* LC_REFEDGE_MAG),
-//	(0.983	* LC_REFEDGE_MAG),
-//	(0.983	* LC_REFEDGE_MAG),
-//	(1.0	* LC_REFEDGE_MAG)
-//};
+/*
+ * Chayka RSDN-3/10 reference pulse leading edge halfwave amplitudes,
+ * distorted by RF circuits in receiver (taken from SPICE simulation)
+ */
+
+lc_type_data_s			lc_refedge_rsdn310[LC_REFEDGE_SZ] = {
+	(0.0878	* LC_REFEDGE_MAG),
+	(-0.1385* LC_REFEDGE_MAG),
+	(0.2066	* LC_REFEDGE_MAG),
+	(-0.2911* LC_REFEDGE_MAG),
+	(0.3873	* LC_REFEDGE_MAG),
+	(-0.4894* LC_REFEDGE_MAG),
+	(0.5951	* LC_REFEDGE_MAG),
+	(-0.6925* LC_REFEDGE_MAG),
+	(0.7817	* LC_REFEDGE_MAG),
+	(-0.8603* LC_REFEDGE_MAG),
+	(0.9237	* LC_REFEDGE_MAG),
+	(-0.9683* LC_REFEDGE_MAG),
+	(0.9894	* LC_REFEDGE_MAG),
+	(-1.0	* LC_REFEDGE_MAG)
+};
+
+/*
+ * Chayka RSDN-5BM reference pulse leading edge halfwave amplitudes,
+ * distorted by RF circuits in receiver (taken from SPICE simulation)
+ */
+
+lc_type_data_s			lc_refedge_rsdn5bm[LC_REFEDGE_SZ] = {
+	(0.1915	* LC_REFEDGE_MAG),
+	(-0.2603* LC_REFEDGE_MAG),
+	(0.3330	* LC_REFEDGE_MAG),
+	(-0.4180* LC_REFEDGE_MAG),
+	(0.5079	* LC_REFEDGE_MAG),
+	(-0.5989* LC_REFEDGE_MAG),
+	(0.6794	* LC_REFEDGE_MAG),
+	(-0.7651* LC_REFEDGE_MAG),
+	(0.8423	* LC_REFEDGE_MAG),
+	(-0.8995* LC_REFEDGE_MAG),
+	(0.9471	* LC_REFEDGE_MAG),
+	(-0.9735* LC_REFEDGE_MAG),
+	(0.9937	* LC_REFEDGE_MAG),
+	(-1.0	* LC_REFEDGE_MAG)
+};
 
 /*
  * US Coast Guard reference pulse leading edge halfwave amplitudes, distorted by
@@ -50,7 +69,6 @@ lc_type_data_s			lc_refedge_uscg[LC_REFEDGE_SZ] = {
 	(0.9219	* LC_REFEDGE_MAG),
 	(-0.9694* LC_REFEDGE_MAG),
 	(0.9905	* LC_REFEDGE_MAG),
-	(-1.0	* LC_REFEDGE_MAG),
-
+	(-1.0	* LC_REFEDGE_MAG)
 };
 

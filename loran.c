@@ -9,12 +9,15 @@
 
 /* Phase codes for GRI A and B */
 
-_Bool lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT] = {
-	{1, 1, 0, 0, 1, 0, 1, 0,  1, 0, 0, 1, 1, 1, 1, 1},	/* MasA */
-	{1, 0, 0, 1, 1, 1, 1, 1,  1, 1, 0, 0, 1, 0, 1, 0},	/* MasB	*/
-	{1, 1, 1, 1, 1, 0, 0, 1,  1, 0, 1, 0, 1, 1, 0, 0},	/* SlaveA */
-	{1, 0, 1, 0, 1, 1, 0, 0,  1, 1, 1, 1, 1, 0, 0, 1}	/* SlaveB */
+int lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT] = {
+	{ 1, 1,-1,-1, 1,-1, 1,-1,  1,-1,-1, 1, 1, 1, 1, 1},	/* MasA */
+	{ 1,-1,-1, 1, 1, 1, 1, 1,  1, 1,-1,-1, 1,-1, 1,-1},	/* MasB	*/
+	{ 1, 1, 1, 1, 1,-1,-1, 1,  1,-1, 1,-1, 1, 1,-1,-1},	/* SlaveA */
+	{ 1,-1, 1,-1, 1, 1,-1,-1,  1, 1, 1, 1, 1,-1,-1, 1},	/* SlaveB */
+	{ 1, 0, 0, 0,-1, 0, 0, 0,  1, 0, 0, 0,-1, 0, 0, 0}	/* Synthetic */
 };
+
+int lc_pc_acorr[LC_PC_CNT] = {16, 16, 16, 16, 4};
 
 /*
  * Comb filter delays(minimal FRI count) for output level (gamma) = 0.7
@@ -43,6 +46,7 @@ void lc_init(struct lc_chain *chain)
 	for(size_t i = 0; i < chain->station_cnt; ++i) {
 		struct lc_station *sta = &chain->sta[i];
 
+		sta->idx = i;
 		sta->offset = 0;
 		sta->fris_passed = 0;
 		sta->last_gri_idx = 0;
@@ -53,11 +57,13 @@ void lc_init(struct lc_chain *chain)
 		for(size_t j = 0; j < LC_PC_CNT; ++j) {
 			memset(sta->xcorr_tmp[j], 0,
 			       LC_STA_WINSZ * sizeof(lc_type_data_s));
-			memset(sta->xcorr_pc[j], 0,
+			memset(sta->xcorr[j], 0,
 			       LC_STA_WINSZ * sizeof(lc_type_comb_s));
+			sta->xcorr_var[j] = 0;
 		}
 		memset(sta->win0, 0,
 		       LC_STA_WINSZ * sizeof(lc_type_comb_s));
+		sta->win0_var = 0;
 	}
 
 	printf("------------------------\n"
@@ -76,6 +82,48 @@ void lc_init(struct lc_chain *chain)
 
 	lc_calc_free_intervals(chain);
 	lc_start_seek(chain);
+}
+
+/*
+ * Calculate spanzones given station offset
+ */
+
+static void lc_calc_spans(struct lc_chain *chain, struct lc_station *sta)
+{
+	assert(sta->offset < chain->grin);
+
+	for(size_t i = 0; i < LC_GRCNT; ++i) {
+		sta->spans[i].begin = sta->offset + chain->grin * i;
+		sta->spans[i].end = sta->spans[i].begin + LC_STA_SPAN;
+		sta->spans[i].win_idx = LC_STA_GRIWCNT * i;
+		sta->spans[i].win_offset = 0;
+	}
+
+	sta->spans_cnt = LC_GRCNT;
+
+	if(sta->spans[LC_GRCNT-1].end > chain->frin) {
+		struct lc_spanzone *nsz = &sta->spans[LC_GRCNT];
+		nsz->begin = 0;
+		nsz->end = sta->spans[LC_GRCNT-1].end - chain->frin;
+		/* Calculate window index and offset into it for new spanzone */
+		size_t sploff = chain->frin - sta->spans[LC_GRCNT-1].begin;
+		size_t wcnt = sploff / LC_STA_WININT;
+		size_t woff = sploff - wcnt * LC_STA_WININT;
+		nsz->win_idx = sta->spans[LC_GRCNT-1].win_idx + wcnt;
+		nsz->win_offset = woff;
+
+		sta->spans[LC_GRCNT-1].end = chain->frin;
+		sta->spans_cnt = LC_GRCNT + 1;
+	}
+
+	sta->span_next = 0;
+	sta->span0_open = 0;
+//	/* Reporting in */
+//	printf("STA %d (offset %u) spanzones:\n", sta->idx, sta->offset);
+//	for(size_t i = 0; i < sta->spans_cnt; ++i)
+//		printf("\tZone %u: [%u..%u), window %u, win_offset %u\n",
+//		       i, sta->spans[i].begin, sta->spans[i].end,
+//		       sta->spans[i].win_idx, sta->spans[i].win_offset);
 }
 
 /*
@@ -315,6 +363,8 @@ static void lc_start_seek(struct lc_chain *chain)
 
 		sta->state = LC_STAST_SEEK;
 
+		lc_calc_spans(chain, sta);
+
 		chain->seek_sta_cnt++;
 	}
 }
@@ -322,6 +372,9 @@ static void lc_start_seek(struct lc_chain *chain)
 
 static void lc_sta_service_locking(struct lc_chain *chain, struct lc_station *sta)
 {
+	//assert(0);
+	lc_corr_sta(sta);
+	/*
 	char	fname[128];
 
 	snprintf(fname, 127, "data_%u_sta_%d_xc.txt",
@@ -342,6 +395,7 @@ static void lc_sta_service_locking(struct lc_chain *chain, struct lc_station *st
 //		fputs("\n", dfile);
 //	}
 	fclose(dfile);
+	*/
 }
 
 /*
@@ -382,6 +436,8 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 				 * moment
 				 */
 				printf("#SEEK# COMPLETED!\n");
+				lc_calc_free_intervals(chain);
+				lc_calc_seek_ints(chain);
 			}
 
 			if(sta->lock_enabled) {
@@ -399,9 +455,16 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 		}
 	}
 
+	/* Clear windows :3 */
+	memset(sta->win0, 0, sizeof(lc_type_comb_s) * LC_STA_WINSZ);
+	for(size_t i = 0; i < LC_PC_CNT; ++i)
+		memset(sta->xcorr[i], 0, sizeof(lc_type_comb_s) * LC_STA_WINSZ);
+
 	sta->fris_passed = 0;
-	sta->last_gri_idx = 0;
 	sta->offset = new_offset;
+	lc_calc_spans(chain, sta);
+	sta->span_next = 0;
+	//sta->span0_open = 0;
 }
 
 /*
@@ -434,11 +497,11 @@ static void lc_sta_xcorr_tmp_filter(struct lc_station *sta)
 
 		src = sta->xcorr_tmp[pc];
 		src_end = sta->xcorr_tmp[pc] + LC_STA_WINSZ;
-		dst = sta->xcorr_pc[pc];
+		dst = sta->xcorr[pc];
 
 		while(src < src_end) {
 			lc_type_comb_s cs = (lc_type_comb_s) *src << LC_BITS_COMBF;
-			cs = cs / (int) LC_STA_WINCNT;
+			cs = cs / lc_pc_acorr[pc];
 			cs = (*dst * ((1 << sta->comb_kp) - 1) + cs) / (1 << sta->comb_kp);
 			*dst++ = cs;
 			*src++ = 0;	/* Filling xcorr_tmp with zeros */
@@ -461,11 +524,13 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 	assert(win_idx < LC_STA_WINCNT);
 	assert(data_offset < LC_STA_WINSZ);
 
-	//win = &sta->wnd[win_idx];
+//	printf("STA %u WINDOW %2u OFF %5u SIZE %4u\n",
+//	       sta->idx, win_idx, data_offset, count);
 	wptr = sta->win0 + data_offset;
 	data_end = data + count;
 
 	lc_type_sample	sd = sta->dcrem_buf;
+
 	while(data < data_end) {
 		lc_type_sample	s = *data++;		/* Take sample */
 		lc_type_data_s	ss;			/* DC notch output */
@@ -486,10 +551,10 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 		 */
 
 		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-			_Bool pcbit = lc_pc[pc][win_idx];
-			if(pcbit)
+			int pcbit = lc_pc[pc][win_idx];
+			if(pcbit > 0)
 				sta->xcorr_tmp[pc][data_offset] += ss;
-			else
+			else if(pcbit < 0)
 				sta->xcorr_tmp[pc][data_offset] -= ss;
 		}
 
@@ -513,86 +578,77 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
  * Redirects these samples to individual windows...
  */
 static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
-			       size_t gri_idx, size_t data_offset,
-			       lc_type_sample *data, size_t count)
+			       size_t data_offset, lc_type_sample *data,
+			       size_t count)
 {
-	size_t		griw_base, startw_idx, widx;
-	size_t		startw_offset;
-	size_t		data_end;
+	struct lc_spanzone *sz = &sta->spans[sta->span_next];
+
+	size_t		startw, widx;
+	size_t		win_offset, data_end;
 
 	if(!count)
 		return;
-	assert((data_offset + count) <= LC_STA_SPAN);
 
-	griw_base = gri_idx * LC_STA_GRIWCNT;
-	startw_idx = data_offset / LC_STA_WININT;
-	assert(startw_idx < LC_STA_GRIWCNT);
+	assert(data_offset + count <= sz->end - sz->begin);
 
-//	printf("Loran station samples:\n"
-//	       "\tSTA offset: %u\n"
-//	       "\tData GRI index: %u\n"
-//	       "\tData offset: %u\n"
-//	       "\tData length: %u\n"
-//	       "\tWindow begin: %u\n",
-//	       sta->offset, gri_idx,
-//	       data_offset,
-//	       count, startw_idx + griw_base);
+//	if(data_offset == 0 && sta->span_next == 0)
+//		sta->span0_open = 1;
+//	if(!sta->span0_open)
+//		return;
 
+//	printf("\nSTA %u SPANZONE %u OFF %5u SIZE %4u\n",
+//	       sta->idx,  sta->span_next, data_offset, count);
+	/* Here data_offset is offset from beginning of _spanzone_ */
+	win_offset = data_offset + sz->win_offset;
+	startw = win_offset / LC_STA_WININT;
+	win_offset-= startw * LC_STA_WININT;
+	assert(win_offset < LC_STA_WININT);
+	startw+= sz->win_idx;
+//	printf("\tSTARTW %u WOFF %u\n", startw, win_offset);
+	/*
+	 * Now win_offset is offset from beginning of _window_ startw,
+	 * and startw is first window that new data belongs to
+	 */
 
-	startw_offset = startw_idx * LC_STA_WININT;
-	assert(data_offset >= startw_offset);
-	data_offset-= startw_offset;
-	assert(data_offset < LC_STA_WININT);
-	data_end = data_offset + count;
+	data_end = win_offset + count;
 
-	for(widx = (startw_idx + griw_base);; ++widx) {
-
-//		printf("\tDATA for window %u\n"
-//		       "\t\tStart of data: %u\n"
-//		       "\t\tEnd of data: %u\n",
-//		       i, data_offset, data_end);
-
-		if(data_offset < LC_STA_WINSZ) {
-			size_t spansize = data_end > LC_STA_WINSZ ?
-						(LC_STA_WINSZ - data_offset):
-						(data_end - data_offset);
-			lc_win_new_samples(sta, widx, data_offset,
-					   data, spansize);
+	for(widx = startw;; ++widx) {
+		if(win_offset < LC_STA_WINSZ) {
+			size_t ov_end = LC_MIN(data_end, LC_STA_WINSZ);
+			lc_win_new_samples(sta, widx, win_offset,
+					   data, ov_end - win_offset);
 		}
 
-		size_t readcount;
 		if(data_end <= LC_STA_WININT)
-			//readcount = data_end - data_offset;
 			break;
-		readcount = LC_STA_WININT - data_offset;
 
-//		printf("\tRead: %u samples\n", readcount);
-
-//		if(data_end <= LC_STA_WININT)
-//			break;
+		size_t readcount = LC_STA_WININT - win_offset;
 
 		data_end-= LC_STA_WININT;
 		data+= readcount;
-		data_offset = 0;
+		win_offset = 0;
 	}
 
-	sta->last_gri_idx = gri_idx;
-	/*
-	 * If station has just filled in last window in FRI, check for this
-	 * and call service routine if needed
-	 *
-	 * Also, perform comb-filtering (integration) of xcorr_tmp intermediate
-	 *  PC correlation results into xcorr_pc
-	 */
-	if(widx == LC_STA_WINCNT-1 && data_end >= LC_STA_WINSZ) {
-		lc_sta_xcorr_tmp_filter(sta);
-
-		sta->fris_passed++;
-		if(sta->ssr_call_period &&
-		   sta->fris_passed >= sta->ssr_call_period) {
-			lc_sta_service(chain, sta);
-			sta->fris_passed = 0;
+	/* If data fills spanzone completely, switch to next spanzone */
+	if(data_offset + count == sz->end - sz->begin) {
+		if(sta->span_next == sta->spans_cnt - 1) {
+			sta->span_next = 0;
+			/*
+			 * Increment passed FRIs counter, cause we've just
+			 * filled last spanzone
+			 */
+			sta->fris_passed++;
+			/* Perform comb-filtering of gathered xcorr_tmp wins */
+			lc_sta_xcorr_tmp_filter(sta);
+		} else {
+			sta->span_next++;
 		}
+	}
+
+	/* Call SSR if enough FRIs have passed through */
+	if(sta->ssr_call_period && sta->fris_passed >= sta->ssr_call_period) {
+		lc_sta_service(chain, sta);
+		sta->fris_passed = 0;
 	}
 }
 
@@ -619,54 +675,19 @@ void lc_new_samples(struct lc_chain *chain, lc_type_sample *buf, size_t count)
 
 		for(size_t i = 0; i < chain->station_cnt; ++i) {
 			struct lc_station *sta = &chain->sta[i];
-			for(size_t j = 0; j < LC_GRCNT; ++j) {
-				/* Station region boundaries */
-				size_t sta_begin = sta->offset +
-						   j * chain->grin;
-				size_t sta_end = sta_begin + LC_STA_SPAN;
 
-				/**printf("##STA %u\tGRI %u\tBEGIN: %u\tEND: %u###\n",
-				       i, j, sta_begin, sta_end);*/
+			struct lc_spanzone *sz = &sta->spans[sta->span_next];
 
-				/* Overlap region boundaries */
-				size_t ov_begin, ov_end;
-				/*
-				 * Length of station region that goes beyond
-				 * FRI boundary
-				 */
-				size_t ovi_span = sta_end - chain->frin;
-				/*
-				 * Remap data from near beginning of FRI beyond
-				 * the end of FRI and pass it to corresponding
-				 * "overlapping" station
-				 */
-				if(sta_end > chain->frin &&
-				   sta->last_gri_idx == LC_GRCNT-1 &&
-				   buf_begin < ovi_span) {
-					/**printf("##OVERLAPPING##\n");*/
-					ov_begin = buf_begin;
-					ov_end = buf_end > ovi_span ?
-							 ovi_span : buf_end;
-					lc_sta_new_samples(chain, sta, j,
-							   chain->frin + ov_begin - sta_begin,
-							   buf,
-							   ov_end - ov_begin);
-				}
-				/*
-				 * Process non-"overlapping" station data
-				 */
-				ov_begin = sta_begin > buf_begin ?
-						   sta_begin : buf_begin;
-				ov_end = buf_end > sta_end ?
-						 sta_end : buf_end;
-				if(ov_end > ov_begin) {
-					/**printf("##NORMAL##\n");*/
-					lc_sta_new_samples(chain, sta, j,
-							   ov_begin - sta_begin,
-							   buf + ov_begin - buf_begin,
-							   ov_end - ov_begin);
-				}
-			}
+			size_t ov_begin = LC_MAX(sz->begin, buf_begin);
+			size_t ov_end = LC_MIN(sz->end, buf_end);
+
+			if(ov_begin >= ov_end)
+				continue;
+
+			/* We have buffer overlapping with spanzone.. */
+			lc_sta_new_samples(chain, sta, ov_begin - sz->begin,
+					   buf + ov_begin - buf_begin,
+					   ov_end - ov_begin);
 		}
 
 		size_t read_cnt;
@@ -680,4 +701,3 @@ void lc_new_samples(struct lc_chain *chain, lc_type_sample *buf, size_t count)
 	if(chain->next_sample >= chain->frin)
 		chain->next_sample-= chain->frin;
 }
-

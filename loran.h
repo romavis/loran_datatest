@@ -6,6 +6,9 @@
 
 #include "loran_reference.h"
 
+#define LC_MAX(x,y)	((x) > (y) ? (x) : (y))
+#define LC_MIN(x,y)	((x) < (y) ? (x) : (y))
+
 /*******************************************************************************
  * Basic info about Loran-C signal processing stages
  *
@@ -250,48 +253,74 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 /* Single window size */
 #define LC_STA_WINSZT	500U					/* in uS */
 #define LC_STA_WINSZ	(LC_FS * LC_STA_WINSZT / 1000000)	/* in samples */
-/* Window (station) shift step used in seek process */
-#define LC_STA_WINSHIFT	(LC_STA_WINSZ / 2)
 
 /*
- * Center part of window definition: [begin, end)
- *  Every sample from GRI belongs to exactly one such "center part", despite
- *  the fact that ordinal search windows overlap (by intent)
+ * Approximate pulse leading edge length
+ * Used to ensure that leading edge fits in window in detection phase
  */
-#define LC_STA_WINQSZ	(LC_STA_WINSZ / 4)	/* quarter of a window */
-#define LC_WCEN_BEGIN	LC_STA_WINQSZ
-#define LC_WCEN_END	(LC_STA_WINSHIFT + LC_STA_WINQSZ)
-/* Samples available in ordinal window before and after center part */
-#define LC_WCEN_PRE	LC_WCEN_BEGIN
-#define LC_WCEN_POST	(LC_STA_WINSZ - LC_WCEN_BEGIN)
+#define LC_PLE_SZT	100U					/* in uS */
+#define LC_PLE_SZ	(LC_FS * LC_PLE_SZT / 1000000)		/* in samples */
+
+/* Window (station) shift step used in seek process */
+//#define LC_STA_WINSHIFT	(LC_STA_WINSZ / 2)
+#define LC_STA_WINSHIFT	(LC_STA_WINSZ - LC_PLE_SZ)
+
+///*
+// * Center part of window definition: [begin, end)
+// *  Every sample from GRI belongs to exactly one such "center part", despite
+// *  the fact that ordinal search windows overlap (by intent)
+// */
+//#define LC_STA_WINQSZ	(LC_STA_WINSZ / 4)	/* quarter of a window */
+//#define LC_WCEN_BEGIN	LC_STA_WINQSZ
+//#define LC_WCEN_END	(LC_STA_WINSHIFT + LC_STA_WINQSZ)
+///* Samples available in ordinal window before and after center part */
+//#define LC_WCEN_PRE	LC_WCEN_BEGIN
+//#define LC_WCEN_POST	(LC_STA_WINSZ - LC_WCEN_BEGIN)
+
+/*
+ * Define right-half of window. Normally we process pulse only if its peak
+ *  lies in right-half. This provides some guarantee that beginning of the pulse
+ *  can be found in left-half
+ */
+#define LC_WIN_RH	(LC_STA_WINSZ - LC_STA_WINSHIFT)
 
 /* Station single GRI windows "pack" duration (in samples) */
 #define LC_STA_SPAN	(LC_STA_WININT * (LC_STA_GRIWCNT - 1) + LC_STA_WINSZ)
 /* 9.9ms interval (in samples) used to apply timing constraints */
 #define LC_INT_99MS	(LC_FS * 99 / 10000)
-/*
- * Approximate pulse leading edge length: 70us
- * Used to ensure that leading edge fits in window when found pulse peak
- */
-#define LC_PLE_SZT	70U					/* in uS */
-#define LC_PLE_SZ	(LC_FS * LC_PLE_SZT / 1000000)		/* in samples */
 
 /*******************************************************************************
  * Phase codes
+ *
+ * There are 4 8-bit codes defined in Loran-C standard: Master A,B and Slave A,B
+ * These codes are used for corresponding stations' (master/slave) pulse groups
+ *  switching between A and B codes in every next GRI. FRI contains two
+ *  consequtive GRIs, during which, obviously, every station have used both A
+ *  and B codes. We construct 4 16-bit codes that represent each of possible
+ *  cases of phase code sequences for every station on FRI:
+ *  0 - Master A then Master B
+ *  1 - Master B then Master A
+ *  2 - Slave A then Slave B
+ *  3 - Slave B then Slave A
+ *
+ * One another code (4) was handcrafted to help solving pulse group search
+ *  ambiguity in one very special but yet too common case.
  */
 
 #define LC_PC_MASTER_A	0
 #define LC_PC_MASTER_B	1
 #define LC_PC_SLAVE_A	2
 #define LC_PC_SLAVE_B	3
+#define LC_PC_SYNTH	4
 
-#define LC_PC_CNT	4
+#define LC_PC_NCNT	4	/* "Normal" PC count */
+#define LC_PC_CNT	5	/* Overall PC count, including synthetic ones */
 
 /*
  * Phase codes themself
- * Values meaning: 0 - coefficient '+1', 1 - '-1'
+ * Values meaning: >0 - coefficient '+1', <0 - '-1', 0 - '0'
  */
-extern _Bool		lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT];
+extern int		lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT];
 
 /*******************************************************************************
  * Data structures
@@ -299,18 +328,10 @@ extern _Bool		lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT];
 
 /*
  * Maximal station count in one chain. Refers to count of lc_station structures,
- *  intervals, seek intervals for each stationactually allocated.
+ *  intervals, seek intervals for each station actually allocated.
  * Allocation is completely static and compile-time here
  */
 #define LC_STA_MAXCNT	8
-
-/* Represents single subwindow (that contains one pulse leading edge) */
-//struct lc_subwin {
-//	size_t		offset;
-
-//	lc_type_sample	dcrem_buf;
-//	lc_type_comb_s	data[LC_STA_WINSZ];
-//};
 
 /* Represents interval inside GRI: [begin, end). NOTE: end >= begin (always) */
 struct lc_int {
@@ -324,16 +345,49 @@ struct lc_int {
 #define LC_STAST_BUSY	2
 #define LC_STAST_LOCKING 3
 
-#define LC_STA_IS_BUSY(x) ((x)->state == LC_STAST_BUSY)
+#define LC_STA_IS_BUSY(x) ((x)->state == LC_STAST_BUSY || (x)->state == LC_STAST_LOCKING)
 #define LC_STA_IS_IDLE(x) ((x)->state == LC_STAST_IDLE)
+
+/*
+ * Spanzone: interval on FRI (strictly in FRI coordinates: 0..FRIn-1)
+ *  that station "occupies".
+ * At max there are 3 spanzones, minimal count is 2.
+ * Spanzones follow ordering:
+ *  zone 0 - first zone (begin = offset)
+ *  zone 1 - next zone (begin = GRIn+offset)
+ *  ...
+ *  zone N - exists when zone 1 "overlaps" over end of FRI and represents
+ *   overlapping part of zone 1 (begin = 0)
+ */
+
+/* Struct represents spanzone - interval of FRI that station occupies */
+struct lc_spanzone {
+	/* In FRI "coordinates" (i.e. 0..FRIn-1 for begin, ..FRIn for end) */
+	size_t		begin;
+	size_t		end;
+
+	size_t		win_idx;
+	size_t		win_offset;
+};
 
 /* Struct represents single station */
 struct lc_station {
 	/*** GENERIC ***/
+	/* Station index */
+	size_t		idx;
 	/* Offset inside GRI: from 0 to GRIn-1 */
 	size_t		offset;
-	/* P to use for comb filter */
-	int		comb_kp;
+
+	struct lc_spanzone spans[LC_GRCNT + 1];
+	uint8_t		spans_cnt;
+	/* Next spanzone to be processed by filling routine */
+	uint8_t		span_next;
+
+	/*
+	 * Sets to true when spanzone 0 begins being filled - passed FRIs are
+	 *  counted from this moment
+	 */
+	_Bool		span0_open;
 
 	/* Number of FRIs passed "through" station (internal use) */
 	size_t		fris_passed;
@@ -342,11 +396,13 @@ struct lc_station {
 	/* Period (FRIs count) to call station service routine with */
 	size_t		ssr_call_period;
 
+
+	/* P to use for comb filter */
+	int		comb_kp;
+
 	/* DC removal filter delay line */
 	lc_type_sample	dcrem_buf;
 
-	/* Integration windows: the "source" of station signal for processing */
-//	struct lc_subwin wnd[LC_GRCNT*LC_STA_GRIWCNT];
 	/*
 	 * Window that stores comb-filtered representation of first pulse (first
 	 *  bit of PC)
@@ -365,7 +421,14 @@ struct lc_station {
 	 * These are result of passing xcorr_tmp windows through a comb filter
 	 * during several FRIs
 	 */
-	lc_type_comb_s	xcorr_pc[LC_PC_CNT][LC_STA_WINSZ];
+	lc_type_comb_s	xcorr[LC_PC_CNT][LC_STA_WINSZ];
+
+	/*
+	 * Win0 and PC cross-correlation windows' signal variance.
+	 *  Can be thought of as a measure of in-window signal power
+	 */
+	uint32_t	win0_var;
+	uint32_t	xcorr_var[LC_PC_CNT];
 
 	/* Station state */
 	int		state;
@@ -383,6 +446,7 @@ struct lc_station {
 	size_t		lock_point;
 	size_t		lock_pc;
 	_Bool		lock_enabled;
+	int32_t		pbegin_last;
 };
 
 /* Struct represents single Loran-C chain */

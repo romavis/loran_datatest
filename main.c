@@ -45,8 +45,8 @@ int main(int argc, char **argv)
 
 	/* Initialize Loran-C structs */
 	//lorchain.gri = 8000;
-	lorchain.gri = 8830;
-	lorchain.station_cnt = 5;
+	lorchain.gri = 8000;
+	lorchain.station_cnt = 8;
 	lc_init(&lorchain);
 
 	/* Initialize buffer */
@@ -60,6 +60,9 @@ int main(int argc, char **argv)
 	samplebufend = samplebuf + samplebufsize;
 	sampleptr = samplebuf;
 
+	size_t skipcnt	= 0;//22000;
+	printf("Skipping %u first samples\n", skipcnt);
+
 	/* Read all the samples into memory */
 	printf("Reading samples from file..\n");
 	while(1) {
@@ -68,10 +71,15 @@ int main(int argc, char **argv)
 		while(sampleptr < samplebufend) {
 			unsigned int val;
 			ret = fscanf(dfile, "%u", &val);
-			if(ret > 0)
+			if(ret > 0) {
+				if(skipcnt) {
+					skipcnt--;
+					continue;
+				}
 				*sampleptr++ = val;
-			else
+			} else {
 				break;
+			}
 		}
 		size_t		samplecnt;
 		samplecnt = sampleptr - samplebuf;
@@ -124,7 +132,7 @@ int main(int argc, char **argv)
 		sampleptr+= samplecnt;
 		if(sampleptr == sample_last) {
 			fri_counter+= fri_cnt;
-			printf("Passed %u FRIs\n", fri_counter);
+			printf("[Passed %6u FRIs]\n", fri_counter);
 			if(fri_counter >= fri_tested)
 				break;
 			sampleptr = samplebuf;
