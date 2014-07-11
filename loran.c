@@ -23,7 +23,7 @@ int lc_pc_acorr[LC_PC_CNT] = {16, 16, 16, 16, 4};
  * Comb filter delays(minimal FRI count) for output level (gamma) = 0.7
  */
 size_t lc_comb_delay[LC_COMB_KP_MAX + 1] = {
-	0, 2, 5, 9, 19, 38, 77, 154, 308, 616, 1233
+	1, 2, 5, 9, 19, 38, 77, 154, 308, 616, 1233
      /* 0  1  2  3  4   5   6   7    8    9    10 */
 };
 
@@ -40,8 +40,10 @@ void lc_init(struct lc_chain *chain)
 	chain->grin = (LC_FS / 100000) * chain->gri;
 	chain->frin = LC_GRCNT * chain->grin;
 
-	chain->free_int_cnt = 0;
 	chain->next_sample = 0;
+
+	chain->seek_cand_cnt = 0;
+	chain->free_int_cnt = 0;
 
 	for(size_t i = 0; i < chain->station_cnt; ++i) {
 		struct lc_station *sta = &chain->sta[i];
@@ -118,12 +120,6 @@ static void lc_calc_spans(struct lc_chain *chain, struct lc_station *sta)
 
 	sta->span_next = 0;
 	sta->span0_open = 0;
-//	/* Reporting in */
-//	printf("STA %d (offset %u) spanzones:\n", sta->idx, sta->offset);
-//	for(size_t i = 0; i < sta->spans_cnt; ++i)
-//		printf("\tZone %u: [%u..%u), window %u, win_offset %u\n",
-//		       i, sta->spans[i].begin, sta->spans[i].end,
-//		       sta->spans[i].win_idx, sta->spans[i].win_offset);
 }
 
 /*
@@ -322,11 +318,104 @@ static void lc_calc_seek_ints(struct lc_chain *chain)
 }
 
 /*
+ * Perform candidate selection based on set of candidates, Loran timing
+ *  constraints and points that are already in LOCKING/TRACKING state
+ */
+static void lc_select_candidates(struct lc_chain *chain)
+{
+	if(!chain->seek_cand_cnt)
+		return;
+	assert(chain->seek_cand_cnt <= LC_CAND_MAXCNT);
+
+	uint8_t *idxs = alloca(sizeof(uint8_t) * chain->seek_cand_cnt);
+
+	for(size_t i = 0; i < chain->seek_cand_cnt; ++i) {
+		uint32_t sta_off = chain->seek_cand[i].offset;
+
+		size_t j;
+		for(j = i; j > 0 &&
+		    chain->seek_cand[idxs[j - 1]].offset > sta_off; --j)
+			idxs[j] = idxs[j - 1];
+		idxs[j] = i;
+	}
+
+	printf("\tSORTED: ");
+	for(size_t i = 0; i < chain->seek_cand_cnt; ++i)
+		printf("%u ", idxs[i]);
+	printf("\n");
+	/*
+	 * Task: leave candidate set that satisfies Loran-C timing constaints
+	 *  i.e. there can be two (or more) candidates distributed in a way that
+	 *  beginning of one falls into protected 9.9ms interval after beginning
+	 *  of other.
+	 * These "overlappings" can form chain-like sets on a GRI "wheel" (GRI
+	 *  resembles a wheel, because the end of GRI interval is followed
+	 *  immediately by its beginning thanks to periodic nature of Loran
+	 *  signal).
+	 * To accomplish the task simple algorithm is presented: even if there
+	 *  are lot of candidates, and they overlap with each other forming
+	 *  large "chain" of overlappings on GRI, there is also interval free
+	 *  of any candidates, so that "chain" of overlappings is not a cycle.
+	 * First we try to find such position, that is also a true "beginning"
+	 *  of chained overlaps, and then go through chain, removing certain
+	 *  candidates, thus satisfying Loran constraints.
+	 *
+	 * If algorithm is unable to find such position, it means that
+	 *  overlappings "chain" is cyclic and there is no single solution that
+	 *  is based only on candidates' offsets...
+	 */
+
+	uint32_t restr_end = 0;
+	size_t start_idx = 0;
+	for(; start_idx < chain->seek_cand_cnt; ++start_idx) {
+		uint32_t off = chain->seek_cand[idxs[start_idx]].offset;
+
+		if(off >= restr_end && off >= LC_INT_99MS) {
+			/*
+			 * We've found candidate not overlapped by any previous
+			 */
+			break;
+		}
+		restr_end = off + LC_INT_99MS;
+	}
+
+	/*
+	 * Iterate from start_idx over all candidates (in cycle), and set
+	 * passed/not passed flag for each of them
+	 */
+	restr_end = 0;
+	size_t i = start_idx;
+	while(1) {
+		struct lc_cand *cand = &chain->seek_cand[idxs[i]];
+
+		if(cand->offset >= restr_end) {
+			/* Current candidate passes selection.. */
+			cand->passed = 1;
+			restr_end = off + LC_INT_99MS;
+		} else {
+			/* Doesn't pass - discard */
+			cand->passed = 0;
+		}
+
+		++i;
+		if(i >= chain->seek_cand_cnt) {
+			i = 0;
+			if(restr_end > chain->grin)
+				restr_end -= chain->grin;
+			else
+				restr_end = 0;
+		}
+		if(i == start_idx)
+			break;
+	}
+}
+
+
+/*
  * Initiate seek process for all IDLE stations
  *
  * Assumes that "free" intervals are already calculated
  */
-
 static void lc_start_seek(struct lc_chain *chain)
 {
 	lc_calc_seek_ints(chain);
@@ -352,7 +441,7 @@ static void lc_start_seek(struct lc_chain *chain)
 
 		sta->seek_cur_int = &sta->seek_ints[0];
 		sta->seek_complete = 0;
-		sta->comb_kp = 8;	/* Default SEEK value */
+		sta->comb_kp = 6;	/* Default SEEK value */
 		sta->offset = sta->seek_cur_int->begin;
 
 		sta->fris_passed = 0;
@@ -369,33 +458,46 @@ static void lc_start_seek(struct lc_chain *chain)
 	}
 }
 
+/*
+ * Called when all SEEK stations have processed their seek intervals and went
+ *  into IDLE state
+ *
+ * Task: process results of seek - filter set of candidates and assign tasks
+ *  to IDLE stations, put them into LOCKING phase, and restart SEEK process
+ *  for stations that were left IDLE, possibly adjusting KP and other params.
+ */
 
-static void lc_sta_service_locking(struct lc_chain *chain, struct lc_station *sta)
+static void lc_seek_completed(struct lc_chain *chain)
 {
-	//assert(0);
-	lc_corr_sta(sta);
-	/*
-	char	fname[128];
-
-	snprintf(fname, 127, "data_%u_sta_%d_xc.txt",
-		 chain->gri, sta - chain->sta);
-
-	FILE* dfile = fopen(fname, "ab");
-	if(!dfile) {
-		perror("fopen() while writing windows contents");
-		return;
+	printf("#SEEK# COMPLETED! We have %u candidates\n",
+	       chain->seek_cand_cnt);
+	for(size_t i = 0; i < chain->seek_cand_cnt; ++i) {
+		printf("\t@ %5u: PC %u, ACC %6u\n",
+		       chain->seek_cand[i].offset, chain->seek_cand[i].pc,
+		       chain->seek_cand[i].accuracy);
 	}
-	for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-		fprintf(dfile, "%d ", (sta->xcorr_pc[sta->lock_pc][j] >> LC_BITS_COMBF));
-	fputs("\n", dfile);
 
-//	for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-//		for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-//			fprintf(dfile, "%d ", sta->xcorr_pc[pc][j] >> LC_BITS_COMBF);
-//		fputs("\n", dfile);
-//	}
-	fclose(dfile);
-	*/
+	lc_select_candidates(chain);
+
+	/*
+	 * Here we should assign tasks to IDLE stations and put them into
+	 * LOCKING state
+	 */
+
+	lc_calc_free_intervals(chain);
+	lc_calc_seek_ints(chain);
+
+	assert(0);
+}
+
+/*******************************************************************************
+ * Station service routines - called every ssr_call_period FRIs
+ */
+
+static void lc_sta_service_locking(struct lc_chain *chain,
+				   struct lc_station *sta)
+{
+	assert(0);	/* Die */
 }
 
 /*
@@ -410,8 +512,8 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 	assert(sta->state == LC_STAST_SEEK);
 	assert(chain->seek_sta_cnt != 0);
 
-	/* Calculate cross-correlation */
-	lc_corr_sta(sta);
+	/* Process gathered data */
+	lc_process_seek(chain, sta);
 
 	/* Try to advance station offset */
 	size_t		new_offset;
@@ -435,21 +537,19 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 				 * All SEEK stations have completed seek at the
 				 * moment
 				 */
-				printf("#SEEK# COMPLETED!\n");
-				lc_calc_free_intervals(chain);
-				lc_calc_seek_ints(chain);
+				lc_seek_completed(chain);
 			}
 
-			if(sta->lock_enabled) {
-				if(sta->lock_point < LC_STA_WINSHIFT)
-					sta->offset = sta->lock_point + chain->grin - LC_STA_WINSHIFT;
-				else
-					sta->offset = sta->lock_point - LC_STA_WINSHIFT;
-				sta->ssr_call_period = 1;
-				sta->state = LC_STAST_LOCKING;
-				printf("#LOCK# STA %d locking at %u\n",
-				       sta - chain->sta, sta->offset);
-			}
+//			if(sta->lock_enabled) {
+//				if(sta->lock_point < LC_STA_WINSHIFT)
+//					sta->offset = sta->lock_point + chain->grin - LC_STA_WINSHIFT;
+//				else
+//					sta->offset = sta->lock_point - LC_STA_WINSHIFT;
+//				sta->ssr_call_period = 1;
+//				sta->state = LC_STAST_LOCKING;
+//				printf("#LOCK# STA %d locking at %u\n",
+//				       sta - chain->sta, sta->offset);
+//			}
 
 			return;
 		}
@@ -464,7 +564,6 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 	sta->offset = new_offset;
 	lc_calc_spans(chain, sta);
 	sta->span_next = 0;
-	//sta->span0_open = 0;
 }
 
 /*

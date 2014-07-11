@@ -46,6 +46,7 @@ int main(int argc, char **argv)
 	/* Initialize Loran-C structs */
 	//lorchain.gri = 8000;
 	lorchain.gri = 8000;
+	lorchain.refedge = &lc_refedge_rsdn310;
 	lorchain.station_cnt = 8;
 	lc_init(&lorchain);
 

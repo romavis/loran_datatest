@@ -3,7 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <float.h>
+//#include <float.h>
+#include <assert.h>
 
 #define LC_HWAVE_SZT	5U
 #define LC_HWAVE_SZ	(LC_HWAVE_SZT * LC_FS / 1000000)
@@ -20,75 +21,109 @@ struct lc_halfwave
 	lc_type_data_s	mag;
 };
 
-static struct lc_halfwave pulwinhw[LC_WIN_HWAVESCNT];
-
-/**/
-void lc_hwaves_win_gen(lc_type_comb_s *wbuf, struct lc_halfwave *hwbuf,
-		       size_t peakidx)
+struct lc_halfwave_buffer
 {
-	/*
-	 * Go from end to beginning: probably there is more correct 100khz
-	 *  sinewave at the end of pulse than before its beginning :)
-	 */
+	size_t first_sample;
+	size_t hw_count;
+	struct lc_halfwave hwaves[LC_WIN_HWAVESCNT];
+};
 
-	size_t hwend, hwstart;
-	struct lc_halfwave *hwcur;
+static struct lc_halfwave_buffer pulwinhw;
 
-//	hwend = LC_STA_WINSZ - 1;
-//	hwcur =	hwbuf + LC_WIN_HWAVESCNT - 1;
-//	for(size_t i = hwend; i > 0 && hwcur >= hwbuf; --i) {
-//		if(LC_SGN(wbuf[i]) == LC_SGN(wbuf[i - 1]))
-//			continue;
+/*
+ * Support for partial window processing: generates halfwaves for samples
+ *  [first, last], probably including those before start and after end belonging
+ *  to first/last halfwave to correctly determine their magnitude
+ */
+static void lc_hwaves_win_gen(lc_type_comb_s *win, size_t first, size_t last,
+			      struct lc_halfwave_buffer *hwbuf)
+{
+	size_t send, sstart;
+	struct lc_halfwave *hwcur, *hwend;
 
-//		lc_type_comb_s hwamp = 0;
-//		hwstart = i;
-//		for(size_t j = hwstart; j <= hwend; ++j)
-//			if(abs(wbuf[j]) > abs(hwamp))
-//				hwamp = wbuf[j];
-//		hwcur->mag = hwamp >> LC_BITS_COMBF;
-//		hwcur->end = hwend;
-//		hwcur->begin = hwstart;
-//		//printf("HWAVE %3d: %u .. %u , amp %d\n",
-//		//       hwcur - hwbuf, hwstart, hwend, hwamp);
-//		hwcur--;
-//		hwend = i - 1;
-//	}
-	hwstart = 0;
-	hwcur = hwbuf;
-	hwbuf = hwcur + LC_WIN_HWAVESCNT;
+	assert(last >= first);
 
-	for(size_t i = hwstart; i < (LC_STA_WINSZ - 1) && hwcur < hwbuf; ++i) {
-		if(LC_SGN(wbuf[i]) == LC_SGN(wbuf[i + 1]))
+	/* Determine first sample */
+	for(sstart = first; sstart > 0; --sstart)
+		if(LC_SGN(win[sstart]) == LC_SGN(win[sstart-1]))
+			continue;
+
+	hwbuf->first_sample = sstart;
+
+	hwcur = hwbuf->hwaves;
+	hwend = hwcur + LC_WIN_HWAVESCNT;
+
+	for(size_t i = sstart; i < (LC_STA_WINSZ - 1) && hwcur < hwend; ++i) {
+		if(LC_SGN(win[i]) == LC_SGN(win[i + 1]))
 			continue;
 
 		lc_type_comb_s hwamp = 0;
-		hwend = i;
-		for(size_t j = hwstart; j <= hwend; ++j)
-			if(abs(wbuf[j]) > abs(hwamp))
-				hwamp = wbuf[j];
-		hwcur->mag = hwamp >> LC_BITS_COMBF;
-		hwcur->last = hwend;
+		send = i;
+		/* Determine halfwave amplitude - interpolation is welcome! */
+		for(size_t j = sstart; j <= send; ++j)
+			if(abs(win[j]) > abs(hwamp))
+				hwamp = win[j];
 
+		hwcur->mag = hwamp >> LC_BITS_COMBF;
+		hwcur->last = send;
+
+		if(send >= last)
+			break;
 		hwcur++;
-		hwstart = i + 1;
+		sstart = i + 1;
 	}
 	/* Finish halfwaves list */
-	hwcur->last = LC_STA_WINSZ - 1;
+	hwbuf->hw_count = hwcur - hwbuf->hwaves + 1;
 }
 
+static size_t lc_hwave_find_peak(size_t hwidx, lc_type_comb_s *win,
+				 struct lc_halfwave_buffer *hwbuf)
+{
+	assert(hwidx < LC_WIN_HWAVESCNT);
+
+	size_t	start = hwidx ? (hwbuf->hwaves[hwidx-1].last + 1U) :
+			hwbuf->first_sample;
+	size_t	last = hwbuf->hwaves[hwidx].last;
+
+	assert(last >= start);
+
+	int	maxabs = 0;
+	size_t	maxidx = 0;
+
+	for(; start <= last; ++start)
+		if(abs(win[start]) > maxabs) {
+			maxabs = abs(win[start]);
+			maxidx = start;
+		}
+
+	return maxidx;
+}
+
+/*
+ * Tries to find pulse beginning by successive trial-and-error method,
+ *  continuously approximating signal envelope by reference envelope at every
+ *  point using least-squares method, computing normalized error metric and
+ *  selecting the best approximation.
+ * Return value:
+ *  <0 when unable to find successful approximation
+ *  Index of first leading edge halfwave when OK
+ */
 #define LC_BITS_HWBETAF 16
 
-void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
-		     int verbose)
+static int lc_hwaves_match(struct lc_halfwave_buffer *hwbuf,
+			   const struct lc_refedge *refedge, int32_t *acc_ret,
+			   int verbose)
 {
-	struct lc_halfwave *hwcur, *hwbend;
-	int accmax = 0, hwmax = 0;
+	struct lc_halfwave *hwcur, *hwend, *hwmax, *hwb;
+	int32_t accmax = 0;
 
+	assert(hwbuf->hw_count >= LC_REFEDGE_SZ);
 
-	hwcur =	hwbuf;
-	hwbend = hwbuf + LC_WIN_HWAVESCNT - LC_REFEDGE_SZ + 1;
+	hwb = hwbuf->hwaves;
+	hwcur =	hwbuf->hwaves;
+	hwend = hwcur + hwbuf->hw_count - LC_REFEDGE_SZ + 1;
 
-	for(hwcur = hwbuf; hwcur < hwbend; ++hwcur) {
+	for(; hwcur < hwend; ++hwcur) {
 		/*
 		 * Calculate beta coefficient for best curve fit
 		 *  beta = sum(Ri * Vi) / sum(Ri ^ 2)
@@ -117,20 +152,15 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 		 */
 		int32_t sum_rivi = 0;
 		for(size_t i = 0; i < LC_REFEDGE_SZ; ++i)
-			sum_rivi+= hwcur[i].mag * lc_refedge[i];
+			sum_rivi+= hwcur[i].mag * refedge->amps[i];
 
-		beta = sum_rivi / (LC_REFEDGE_CVAR >> LC_BITS_HWBETAF);
-//		if(verbose)
-//			printf("Beta: %d + %d/%d\t", (beta >> LC_BITS_HWBETAF),
-//			       (beta & ((1<<LC_BITS_HWBETAF) - 1)),
-//			       (1<<LC_BITS_HWBETAF));
+		beta = sum_rivi / (refedge->cvar >> LC_BITS_HWBETAF);
 		if(verbose) {
 			printf("Beta: %d + %d/%d\t REFAMP: %4d\t",
 			       (beta >> LC_BITS_HWBETAF),
 			       (beta & ((1<<LC_BITS_HWBETAF) - 1)),
 			       (1<<LC_BITS_HWBETAF),
 			       (abs(beta) * LC_REFEDGE_MAG) >> LC_BITS_HWBETAF);
-
 		}
 
 		/*
@@ -143,7 +173,7 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 
 		for(size_t i = 0; i < LC_REFEDGE_SZ; ++i) {
 			int32_t b_ri;
-			b_ri = beta * lc_refedge[i];
+			b_ri = beta * refedge->amps[i];
 			b_ri >>= LC_BITS_HWBETAF;	/* remove fraction */
 			int32_t psum;
 			psum = (int32_t) b_ri - (int32_t) hwcur[i].mag;
@@ -176,7 +206,7 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 		//comp_lh = (LC_HWAVE_VAL_C >> LC_BITS_HWBETAF) * beta;
 		//comp_lh = (comp_lh >> LC_BITS_HWBETAF) * beta;
 		comp_lh = ((beta * beta) >> LC_BITS_HWBETAF);
-		comp_lh*= (LC_REFEDGE_CVAR >> LC_BITS_HWBETAF);
+		comp_lh*= (refedge->cvar >> LC_BITS_HWBETAF);
 		if(verbose)
 			printf("LH: %8d\t", comp_lh);
 
@@ -186,10 +216,10 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 		else
 			accuracy = comp_lh;
 
-		if(!accmax || hwcur - hwbuf - hwmax < 5){
+		if(!accmax || hwcur - hwmax < 5) {
 			if(accuracy > 80 && accuracy > accmax) {
 				accmax = accuracy;
-				hwmax = hwcur - hwbuf;
+				hwmax = hwcur;
 				if(verbose)
 					printf("'@' ");
 			} else {
@@ -204,8 +234,8 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 		if(verbose) {
 			printf("ACC: %5d\t", accuracy);
 			printf("HW %3d start %3u end %3u mag %4d\n",
-			       hwcur - hwbuf,
-			       hwcur == hwbuf ? 0 : ((hwcur-1)->last + 1),
+			       hwcur - hwb,
+			       hwcur == hwb ? 0 : ((hwcur-1)->last + 1),
 			       hwcur->last,
 			       hwcur->mag);
 		}
@@ -213,22 +243,17 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
 		 * If we just touched last halfwave in window or last point
 		 *  that is served by current window, exit..
 		 */
-		if(hwcur[LC_REFEDGE_SZ].last == LC_STA_WINSZ - 1 ||
-		   hwcur->last >= LC_STA_WINSHIFT - 1)
+		if(hwcur->last >= LC_STA_WINSHIFT - 1)
 			break;
 	}
-	if(verbose) {
-		if(!accmax)
-			printf("\t--UNABLE TO INTERPOLATE--\n");
-		else
-			printf("\t--Selected interpolation at %d (ACC %d)--\n",
-			       sta->offset + hwbuf[hwmax].last, accmax);
+
+	if(accmax) {
+		if(acc_ret)
+			*acc_ret = accmax;
+		return hwmax - hwb;
 	}
-	if(accmax && sta->state == LC_STAST_LOCKING && hwbuf[hwmax].last != sta->pbegin_last) {
-		printf("WARNING %1d Begin of pulse ACC %5d offset %3d, prev %3d, HW %2d\n",
-		       sta->idx, accmax, hwbuf[hwmax].last, sta->pbegin_last, hwmax);
-		sta->pbegin_last = hwbuf[hwmax].last;
-	}
+
+	return -1;
 }
 
 /*
@@ -243,17 +268,18 @@ void lc_hwaves_match(struct lc_station *sta, struct lc_halfwave *hwbuf,
  *  NOTE: If window is greater than 256 points, or samples are > 12 bits,
  *   rewrite and use something clever here!
  */
-static uint32_t lc_calc_var(lc_type_comb_s *win)
+static uint32_t lc_calc_var(lc_type_comb_s *win, size_t first, size_t last)
 {
 	uint32_t res = 0;
-	for(size_t i = 0; i < LC_STA_WINSZ; ++i) {
-		//res += abs((*win++) >> LC_BITS_COMBF);
+	assert(last >= first);
+
+	for(size_t i = first; i <= last; ++i) {
 		int32_t sv = (*win++) >> LC_BITS_COMBF;
 		//res += sv*sv;
 		res += abs(sv);
 	}
 
-	res /= (LC_STA_WINSZ/16);
+	res /= ((last - first) >> 3) + 1;//(LC_STA_WINSZ/16);
 
 	return res;
 }
@@ -261,38 +287,28 @@ static uint32_t lc_calc_var(lc_type_comb_s *win)
 #define LC_WVAR_COMPARABLE(var, ref) ((var) < ((ref) + (ref) / 4) &&\
 				      (var) > ((ref) - (ref) / 4))
 
-void lc_corr_sta(struct lc_station *sta)
+/*
+ * Determines PC (phase code) in sample interval [first, last].
+ * If OK returns phase code index (>=0), if phase code can't be certainly
+ *  deduced, returns negative number.
+ */
+#define LC_PCDET_INCORRECT	-1	/* Return on no correlation with PC */
+#define LC_PCDET_SPURIOUS	-2	/* Return on correlation with >1 PCs */
+static int lc_determine_pc(struct lc_station *sta, size_t first, size_t last)
 {
-	/*
-	 * Find maximum (peak) of signal in win0 and ensure that it is in the
-	 *  middle of window, except if station processes beginning of seek
-	 *  interval
-	 */
-	size_t maxidx = 0;
-	int    maxval = 0;
-
-	for(size_t i = 0; i < LC_STA_WINSZ; ++i)
-		if(abs(sta->win0[i]) > maxval) {
-			maxval = abs(sta->win0[i]);
-			maxidx = i;
-		}
-//	if(maxidx < LC_WCEN_BEGIN || maxidx >= LC_WCEN_END)
-//	if(0 && sta->state == LC_STAST_SEEK && maxidx < LC_WIN_RH &&
-//	   sta->offset != sta->seek_cur_int->begin)
-//		return;
-
+	assert(last >= first);
 	/* Calculate variances of signal in all windows */
-	sta->win0_var = lc_calc_var(sta->win0);
-	for(size_t pc = 0; pc < LC_PC_CNT; ++pc)
-		sta->xcorr_var[pc] = lc_calc_var(sta->xcorr[pc]);
+	sta->win0_var = lc_calc_var(sta->win0, first, last);
+	for(int pc = 0; pc < LC_PC_CNT; ++pc)
+		sta->xcorr_var[pc] = lc_calc_var(sta->xcorr[pc], first, last);
 
 	/*
 	 * First step: determine if one of "normal" XCorr windows has variance
 	 *  similar to that of win0
 	 */
-	size_t pc_cand_idx = 0;
+	int pc_cand_idx = 0;
 	uint32_t pc_cand_var = 0;
-	for(size_t pc = 0; pc < LC_PC_NCNT; ++pc)
+	for(int pc = 0; pc < LC_PC_NCNT; ++pc)
 		if(LC_WVAR_COMPARABLE(sta->xcorr_var[pc], sta->win0_var)) {
 			pc_cand_idx = pc;
 			pc_cand_var = sta->xcorr_var[pc];
@@ -300,12 +316,80 @@ void lc_corr_sta(struct lc_station *sta)
 		}
 
 	if(!pc_cand_var)
+		return LC_PCDET_INCORRECT;
+
+	/*
+	 * Next step: try to find PC with variance similar to that of candidate.
+	 *  If we succeed, then candidate is considered false :-(
+	 * NOTE: now synthetic codes' windows are considered too!
+	 */
+	for(int pc = 0; pc < LC_PC_CNT; ++pc) {
+		if(pc == pc_cand_idx)
+			continue;
+		if(sta->xcorr_var[pc] > (pc_cand_var - pc_cand_var / 4))
+			return LC_PCDET_SPURIOUS;
+	}
+
+	return pc_cand_idx;
+}
+
+/*******************************************************************************
+ * Complex routines that do the thing in different lc_station lifecycle states
+ */
+
+/*
+ * SEEK processing:
+ *  When called, station windows have already accumulated enough samples.
+ *  After return from routine, station will be probably moved to the next point
+ *   in seek interval.
+ *  The task is to analyze present data contained in windows for presence of
+ *   proper Loran-C pulse group, i.e. perform:
+ *  - Amplitude selection
+ *  - Phase code extraction
+ *  - Pulse leading edge search
+ *  - Calculation of pulse shape quality normalized metric
+ *
+ * Upon return from routine, caller probably will write back start-of-pulse
+ *  position into list of candidates along with quality metric.
+ *
+ * ------
+ *
+ * LOCKING processing:
+ *  Routine is called with station positioned in a way that previously found
+ *   start-of-pulse is PRESUMED to be at the center of window.
+ *  Task is to ensure that pulse group signal is stable: has the same PC, always
+ *   has high accuracy of pulse leading edge, and doesn't wander back and forth
+ *   in time... Also routine should determine offset of SOP point from window
+ *   center and require station shift if necessary.
+ *  Routine is called every N FRIs (N can be ~10)
+ *
+ * ------
+ *
+ * TRACKING processing:
+ *  Routine is called with station previously positioned in a way that
+ *   start-of-pulse is EXACTLY at the window center (+- shift introduced by
+ *    1 FRI delay).
+ *  Routine is called _every_ FRI, so performance should be considered too.
+ *
+ *  The task is to scan part of window near its center to determine necessary
+ *   shift, find samples that surround SZC point and perform precise SZC
+ *   interpolation. Also signal integrity should be estimated (amplitude,
+ *   pulse edge quality, PC correlation thresholds satisfied)
+ */
+
+void lc_process_seek(struct lc_chain *chain, struct lc_station *sta)
+{
+	/* Determine PC */
+	int pc = lc_determine_pc(sta, 0, LC_STA_WINSZ - 1);
+
+	if(pc == LC_PCDET_SPURIOUS)
+		printf("\t--SPURIOUS DETECTED--\n");
+	if(pc < 0)
 		return;
 
 	if(sta->state != LC_STAST_LOCKING) {
-		printf("STA %1d PC CANDIDATE: %1u, OFFSET: %5u, MAXVAL %4d, MAXIDX %4u, MAXPOS %5u\n",
-		       sta->idx, pc_cand_idx, sta->offset,
-		       maxval >> LC_BITS_COMBF, maxidx, maxidx + sta->offset);
+		printf("STA %1d PC: %1u, OFFSET: %5u\n",
+		       sta->idx, pc, sta->offset);
 
 		printf("\t      WIN0 level: %7u\n", sta->win0_var);
 		for(size_t pc = 0; pc < LC_PC_CNT; ++pc)
@@ -313,114 +397,28 @@ void lc_corr_sta(struct lc_station *sta)
 			       sta->xcorr_var[pc]);
 	}
 	/*
-	 * Next step: try to find PC with variance similar to that of candidate.
-	 *  If we succeed, then candidate is considered false :-(
-	 * NOTE: now synthetic codes' windows are considered too!
-	 */
-	for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-		if(pc == pc_cand_idx)
-			continue;
-		//if(LC_WVAR_COMPARABLE(sta->xcorr_var[pc], pc_cand_var)) {
-		if(sta->xcorr_var[pc] > (pc_cand_var - pc_cand_var / 4)) {
-			printf("\t--SPURIOUS DETECTED--\n");
-			return;
-		}
-	}
-
-	/*
 	 * Here we can finally assume that station windows at current offset
 	 *  contain correct (from phase coding point of view) pulse group.
 	 * Now pulse edge detection and its correctness estimation should happen
 	 */
+	int32_t edge_acc;
+	int sophw;
 
-	lc_hwaves_win_gen(sta->xcorr[pc_cand_idx], pulwinhw, maxidx);
-	lc_hwaves_match(sta, pulwinhw, sta->state == LC_STAST_SEEK);
-	if(!sta->lock_enabled) {
-		sta->lock_point = sta->offset + maxidx;
-		sta->lock_pc = pc_cand_idx;
-		sta->lock_enabled = 1;
-	}
+	lc_hwaves_win_gen(sta->xcorr[pc], 0, LC_STA_WINSZ - 1, &pulwinhw);
+	sophw = lc_hwaves_match(&pulwinhw, chain->refedge, &edge_acc,
+				sta->state == LC_STAST_SEEK);
+	if(sophw < 0)
+		return;
 
-//	lc_type_comb_s	wmax = 0;	/* Maximum value in windows */
+	size_t sop_offset = lc_hwave_find_peak(sophw, sta->xcorr[pc],
+					       &pulwinhw);
 
-//	for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-//		if(abs(sta->win0[j]) > wmax)
-//			wmax = abs(sta->win0[j]);
+	/* Add new candidate to chain's list */
+	if(chain->seek_cand_cnt == LC_CAND_MAXCNT)
+		return;
 
-//	wmax = wmax >> LC_BITS_COMBF;
-
-//	if(wmax < 90)
-//		return;
-
-//	int xer = 0;
-
-//	/* Find maximum among PC correlation windows */
-//	for(size_t pc = 0; pc < LC_PC_CNT-1; ++pc) {
-//		int max = abs(sta->xcorr[pc][0]);
-//		size_t maxidx = 0;
-//		for(size_t i = 0; i < LC_STA_WINSZ; ++i) {
-//			if(abs(sta->xcorr[pc][i]) > max) {
-//				maxidx = i;
-//				max = abs(sta->xcorr[pc][i]);
-//			}
-//		}
-//		/*
-//		 * Ensure that our peak is within central part of window
-//		 *  This reduces ambiguity in pulse detection (no more than one
-//		 *   window contains given pulse in each seek interval) and also
-//		 *   guarantees that there is enough space before detected peek
-//		 *   and after it (LC_WCEN_PRE and LC_WCEN_POST)
-//		 */
-//		if(maxidx < LC_WCEN_BEGIN || maxidx >= LC_WCEN_END)
-//			continue;
-
-//		max = max >> LC_BITS_COMBF;
-//		int cnorm = (max << LC_BITS_XCNORMF) / (int) wmax;
-
-//		if(cnorm > LC_XCORR_THRES) {
-//			if(sta->state == LC_STAST_SEEK) {
-//				xer = 1;
-//				printf("STA %1d Max for PC %u is at index %u, "
-//				       "val %u, norm %u AMP %d GRI offset %u "
-//				       "(sta offset %u)\n",
-//				       sta->idx, pc, maxidx, max, cnorm, wmax,
-//				       sta->offset + maxidx, sta->offset);
-//			}
-
-//			lc_hwaves_win_gen(sta->win0, pulwinhw, maxidx);
-//			lc_hwaves_match(sta, pulwinhw, sta->state == LC_STAST_SEEK);
-//			if(!sta->lock_enabled) {
-//				sta->lock_point = sta->offset + maxidx;
-//				sta->lock_pc = pc;
-//				sta->lock_enabled = 1;
-//			}
-//		}
-//	}
-
-//	if(xer) {
-//		printf("\t      WIN0 DEVIATION: %5d\n", lc_calc_dev_comb(sta->win0));
-//		for(size_t pc = 0; pc < LC_PC_CNT; ++pc)
-//			printf("\tXCORR PC %u DEVIATION: %5d\n", pc, lc_calc_dev_comb(sta->xcorr[pc]));
-//	}
-
-	/* Output windows content to files... */
-//	if(sta->offset == 33356) {
-//		char	fname[128] = "data_win_33356.txt";
-
-//		FILE* dfile = fopen(fname, "wb");
-//		if(!dfile) {
-//			perror("fopen() while writing windows contents");
-//			return;
-//		}
-//		for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-//			fprintf(dfile, "%d ", (sta->win0[j] >> LC_BITS_COMBF));
-//		fputs("\n", dfile);
-
-//		for(size_t pc = 0; pc < LC_PC_CNT; ++pc) {
-//			for(size_t j = 0; j < LC_STA_WINSZ; ++j)
-//				fprintf(dfile, "%d ", sta->xcorr_pc[pc][j] >> LC_BITS_COMBF);
-//			fputs("\n", dfile);
-//		}
-//		fclose(dfile);
-//	}
+	struct lc_cand *cand = &chain->seek_cand[chain->seek_cand_cnt++];
+	cand->offset = (sta->offset + sop_offset) % chain->grin;
+	cand->pc = pc;
+	cand->accuracy = edge_acc;
 }

@@ -7,7 +7,7 @@
 #include <stddef.h>
 
 /*
- * These are reference pulse edge definitions
+ * Here are reference pulse edge definitions
  *
  * Reference pulse edge is represented as an array of first pulse's N sine
  *  halfwaves amplitudes
@@ -19,18 +19,30 @@ typedef	int16_t	lc_type_refedge;
 #define LC_REFEDGE_SZ	14
 
 /*
- * Pre-calculated sum(Ri ^ 2) - can be thought of as some sort of variance..
+ * struct lc_refedge
+ * Represents reference pulse envelope rising edge model.
+ * As it models envelope, it is given in magnitudes of carrier halfwaves, not
+ *  RF sample values directly.
+ *
+ * Fields:
+ *  -amps: model halfwaves magnitudes,
+ *  -cvar: sum of squares of amps
+ *  -szc_offset: number of halfwave that precedes standard zero crossing (SZC),
+ *   i.e. if it is 5, then SZC is on the edge of 5 and 6 halfwaves
  */
-//#define LC_REFEDGE_CVARFLT 7.3179	/* USCG */
-#define LC_REFEDGE_CVARFLT 6.4986	/* RSDN-3/10 */
-#define LC_REFEDGE_CVAR (int32_t) (LC_REFEDGE_CVARFLT *\
-	(LC_REFEDGE_MAG * LC_REFEDGE_MAG))
 
-extern lc_type_refedge	lc_refedge_uscg[LC_REFEDGE_SZ];
-extern lc_type_refedge	lc_refedge_rsdn310[LC_REFEDGE_SZ];
-extern lc_type_refedge	lc_refedge_rsdn5bm[LC_REFEDGE_SZ];
+struct lc_refedge
+{
+	lc_type_refedge	amps[LC_REFEDGE_SZ];	/* Ri values */
+	int32_t		cvar;			/* Precalculated sum(Ri^2) */
+	uint8_t		szc_offset;
+};
 
-#define lc_refedge lc_refedge_rsdn310
+extern const struct lc_refedge lc_refedge_rsdn310;
+extern const struct lc_refedge lc_refedge_rsdn5bm;
+extern const struct lc_refedge lc_refedge_uscg;
+
+#define lc_refedge_def lc_refedge_rsdn310
 
 
 #endif // LORAN_REFERENCE_H

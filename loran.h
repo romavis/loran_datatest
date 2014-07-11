@@ -262,32 +262,17 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 #define LC_PLE_SZ	(LC_FS * LC_PLE_SZT / 1000000)		/* in samples */
 
 /* Window (station) shift step used in seek process */
-//#define LC_STA_WINSHIFT	(LC_STA_WINSZ / 2)
 #define LC_STA_WINSHIFT	(LC_STA_WINSZ - LC_PLE_SZ)
-
-///*
-// * Center part of window definition: [begin, end)
-// *  Every sample from GRI belongs to exactly one such "center part", despite
-// *  the fact that ordinal search windows overlap (by intent)
-// */
-//#define LC_STA_WINQSZ	(LC_STA_WINSZ / 4)	/* quarter of a window */
-//#define LC_WCEN_BEGIN	LC_STA_WINQSZ
-//#define LC_WCEN_END	(LC_STA_WINSHIFT + LC_STA_WINQSZ)
-///* Samples available in ordinal window before and after center part */
-//#define LC_WCEN_PRE	LC_WCEN_BEGIN
-//#define LC_WCEN_POST	(LC_STA_WINSZ - LC_WCEN_BEGIN)
-
-/*
- * Define right-half of window. Normally we process pulse only if its peak
- *  lies in right-half. This provides some guarantee that beginning of the pulse
- *  can be found in left-half
- */
-#define LC_WIN_RH	(LC_STA_WINSZ - LC_STA_WINSHIFT)
 
 /* Station single GRI windows "pack" duration (in samples) */
 #define LC_STA_SPAN	(LC_STA_WININT * (LC_STA_GRIWCNT - 1) + LC_STA_WINSZ)
 /* 9.9ms interval (in samples) used to apply timing constraints */
-#define LC_INT_99MS	(LC_FS * 99 / 10000)
+/*
+ * LOWERED: Chayka GRI 8000 doesn't satisfy USCG 9.9ms constraint!
+ *  Instead, TD difference is not smaller than ~8.5 ms in RSDN-3/10..
+ */
+//#define LC_INT_99MS	(LC_FS * 99 / 10000)
+#define LC_INT_99MS	(LC_FS * 85 / 10000)
 
 /*******************************************************************************
  * Phase codes
@@ -333,6 +318,12 @@ extern int		lc_pc[LC_PC_CNT][LC_GRCNT * LC_STA_GRIWCNT];
  */
 #define LC_STA_MAXCNT	8
 
+/*
+ * Maximal candidates (Loran pulse groups that are found during seek process)
+ *  count
+ */
+#define LC_CAND_MAXCNT	(LC_STA_MAXCNT * 2)
+
 /* Represents interval inside GRI: [begin, end). NOTE: end >= begin (always) */
 struct lc_int {
 	size_t		begin;
@@ -368,6 +359,14 @@ struct lc_spanzone {
 
 	size_t		win_idx;
 	size_t		win_offset;
+};
+
+/* Struct represents single candidate (position in GRI) for locking */
+struct lc_cand {
+	size_t		offset;		/* Start of pulse offset in GRI */
+	uint32_t	accuracy;	/* Pulse leading edge accuracy */
+	int		pc;		/* Phase code index */
+	_Bool		passed;		/* Selection process pass flag */
 };
 
 /* Struct represents single station */
@@ -462,8 +461,15 @@ struct lc_chain {
 	size_t		free_int_cnt;
 	struct lc_int	free_int[LC_STA_MAXCNT + 1];
 
+	const struct lc_refedge *refedge;
+
+	/* SEEK related */
 	size_t		seek_sta_cnt;
 
+	size_t		seek_cand_cnt;
+	struct lc_cand	seek_cand[LC_CAND_MAXCNT];
+
+	/* Chain stations themself */
 	struct lc_station sta[LC_STA_MAXCNT];
 };
 
@@ -474,10 +480,8 @@ void lc_init(struct lc_chain *chain);
 void lc_new_samples(struct lc_chain *chain, lc_type_sample *buf, size_t count);
 
 /*
- * Find correlation of station signal with all reference pulse trains, all
- * phase codes
+ * Processing functions for different station states
  */
-
-void lc_corr_sta(struct lc_station *sta);
+void lc_process_seek(struct lc_chain *chain, struct lc_station *sta);
 
 #endif // LORAN_H
