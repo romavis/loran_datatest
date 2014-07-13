@@ -10,9 +10,12 @@ QMAKE_CFLAGS += -std=gnu99 -O2
 SOURCES += main.c \
     loran.c \
     loran_reference.c \
-    loran_corr.c
+    loran_corr.c \
+    util.c
 
 HEADERS += \
     loran.h \
-    loran_reference.h
+    loran_reference.h \
+    util.h \
+    loran_types.h
 

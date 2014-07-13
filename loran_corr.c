@@ -243,8 +243,8 @@ static int lc_hwaves_match(struct lc_halfwave_buffer *hwbuf,
 		 * If we just touched last halfwave in window or last point
 		 *  that is served by current window, exit..
 		 */
-		if(hwcur->last >= LC_STA_WINSHIFT - 1)
-			break;
+		//if(hwcur->last >= LC_STA_WINSHIFT - 1)
+		//	break;
 	}
 
 	if(accmax) {
@@ -387,15 +387,13 @@ void lc_process_seek(struct lc_chain *chain, struct lc_station *sta)
 	if(pc < 0)
 		return;
 
-	if(sta->state != LC_STAST_LOCKING) {
-		printf("STA %1d PC: %1u, OFFSET: %5u\n",
-		       sta->idx, pc, sta->offset);
+	printf("STA %1d PC: %1u, OFFSET: %5u\n",
+	       sta->idx, pc, sta->offset);
 
-		printf("\t      WIN0 level: %7u\n", sta->win0_var);
-		for(size_t pc = 0; pc < LC_PC_CNT; ++pc)
-			printf("\tXCORR PC %u level: %7u\n", pc,
-			       sta->xcorr_var[pc]);
-	}
+	printf("\t      WIN0 level: %7u\n", sta->win0_var);
+	for(size_t pc = 0; pc < LC_PC_CNT; ++pc)
+		printf("\tXCORR PC %u level: %7u\n", pc,
+		       sta->xcorr_var[pc]);
 	/*
 	 * Here we can finally assume that station windows at current offset
 	 *  contain correct (from phase coding point of view) pulse group.
@@ -405,8 +403,7 @@ void lc_process_seek(struct lc_chain *chain, struct lc_station *sta)
 	int sophw;
 
 	lc_hwaves_win_gen(sta->xcorr[pc], 0, LC_STA_WINSZ - 1, &pulwinhw);
-	sophw = lc_hwaves_match(&pulwinhw, chain->refedge, &edge_acc,
-				sta->state == LC_STAST_SEEK);
+	sophw = lc_hwaves_match(&pulwinhw, chain->refedge, &edge_acc, 1);
 	if(sophw < 0)
 		return;
 

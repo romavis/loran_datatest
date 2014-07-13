@@ -16,10 +16,8 @@ void loran_info(struct lc_chain *chain)
 	for(size_t i = 0; i < chain->station_cnt; ++i) {
 		printf("LORSTA %u\n"
 		       "\toffset: %u\n"
-		       "\tComb filter P: %d\n"
-		       "\tPassed FRIs: %u\n",
-		       i, chain->sta[i].offset, chain->sta[i].comb_kp,
-		       chain->sta[i].fris_passed);
+		       "\tComb filter P: %d\n",
+		       i, chain->sta[i].offset, chain->sta[i].comb_kp);
 	}
 }
 
@@ -61,7 +59,7 @@ int main(int argc, char **argv)
 	samplebufend = samplebuf + samplebufsize;
 	sampleptr = samplebuf;
 
-	size_t skipcnt	= 0;//22000;
+	size_t skipcnt	= 160;//22000;
 	printf("Skipping %u first samples\n", skipcnt);
 
 	/* Read all the samples into memory */

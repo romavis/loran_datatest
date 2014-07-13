@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "loran_types.h"
 #include "loran_reference.h"
 
 #define LC_MAX(x,y)	((x) > (y) ? (x) : (y))
@@ -76,37 +77,7 @@
  *   cause values on DC filter output to jump up to (approximately) 4095 in
  *   magnitude. Therefore, DC filter output is guaranteed to be in range
  *    [-4095, 4095], NOT [-2048, 2048]!
- *  -
  */
-
-/*******************************************************************************
- * Data types:
- *
- * lc_type_sample - ADC sample type, usually unsigned integer :-)
- * lc_type_data_s - data type on output from DC blocker (usually signed counter-
- *	part of lc_type_sample)
- * lc_type_comb_s - data type inside comb filter buffers, usually - fixed point
- *	with LC_BITS_COMBF fractional part length (signed, of course)
- *	We need fixed point here because just integral type introduces high
- *	quantization error when using high P values
- * lc_type_var - data type for storing variance estimate
- *	should be 2x larger than sample type
- *	It is the type used for cross-correlation window data
- */
-
-typedef uint16_t	lc_type_sample;
-typedef int16_t		lc_type_data_s;
-typedef int32_t		lc_type_comb_s;
-
-typedef int32_t		lc_type_var;
-/**/
-
-typedef uint16_t	lc_type_data_u;	/* Filtered data has this type */
-typedef int16_t		lc_type_data_sf;/* Fixed-point data type
-					   Also see LC_BITS_FRACT */
-typedef	uint32_t	lc_type_var_u;	/* Signed variance data type */
-typedef int32_t		lc_type_var_s;	/* Unsigned variance data type */
-
 
 /*
  * Significant bits in data sample
@@ -114,61 +85,6 @@ typedef int32_t		lc_type_var_s;	/* Unsigned variance data type */
  */
 
 #define LC_BITS_D	12
-
-/*******************************************************************************
- * Cross-correlation related
- *
- * Cross-correlation buffer size (between signal window and reference edge)
- */
-#define LC_XCORR_SZ	((size_t) (LC_STA_WINSZ - LC_REFPULSE_SZ + 1))
-
-/*
- * Some bit counting magic
- *
- * We calculate variance (and cross-correlation) as follows:
- *	X(f,g,N) = 1/N * sum_i(f[i] * g[i]), where i = [0..N-1]
- * If we sum all partial products first and then divide by N, we are running
- * into overflow. If we first divide each partial product by N and then sum all
- * them up, we are running into underflow :-(
- *
- * So, we are going to sum each M products and divide these partial sums by N
- * What is M? M is the number obtained from equation:
- *	M * 2^(2*D) < 2^L
- *	D is count of significant bits in sample type:
- *		for whole-ranged u16 it is 16, for s16 it is 15
- *	L is size of lc_type_var: for u32 it is 32, for s32 it is 31, so
- *		2^L - 1 is maximum representable by lc_type_var value
- *
- * If we are using 12-bit ADC sample with DC removed, then D is 12, L is 31,
- *	partial product can have value up to 2^24. lc_type_var can store value
- *	up to 2^31 - 1. Then we can sum up to 2^(31 - 24) - 1 = 127 partial sums
- *	and guarantee to have no overflow, supposing that sample value is in
- *	range -4096 to 4096 (-2^12 to +2^12)
- */
-
-#define LC_BITS_STYPE(type) (sizeof(type) * 8U - 1)
-#define LC_BITS_UTYPE(type) (sizeof(type) * 8U)
-
-#define LC_BITS_L	LC_BITS_STYPE(lc_type_var)
-
-#define LC_CORR_M	((1U << (LC_BITS_L - 2 * LC_BITS_D)) - 1)
-
-/*
- * Normalized cross-correlation value square maximum should be represented
- * using fixed point number, because its magnitude is usually low (0..4)
- * Length of fractional part is specified by LC_BITS_XCNORMF
- */
-#define LC_BITS_XCNORMF	8
-
-/*
- * Threshold (normalized xcorr square value) for station to become
- *  candidate for locking procedure
- *
- * NOTE: 1. This is default value
- *       2. This is fixed point number value, so take fraction part into account
- */
-
-#define LC_XCORR_THRES	((lc_type_var) (0.7 * (1<<LC_BITS_XCNORMF)))
 
 /*
  * Threshold for estimating whether halfwaves amplitudes fitting is 'good' or
@@ -266,9 +182,19 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 
 /* Station single GRI windows "pack" duration (in samples) */
 #define LC_STA_SPAN	(LC_STA_WININT * (LC_STA_GRIWCNT - 1) + LC_STA_WINSZ)
+
+/* Windows "center": mid-point of possible start-of-pulse positions */
+#define LC_WIN_CENTER	((LC_STA_WINSZ - LC_PLE_SZ) / 2)
+
+/*
+ * Max. window shift value (absolute) that won't cause introducing delay due to
+ * comb filter integration delay.. (delay-free shift)
+ */
+#define LC_STA_DFSHIFT	(LC_WIN_CENTER - LC_WIN_CENTER / 4)
+
 /* 9.9ms interval (in samples) used to apply timing constraints */
 /*
- * LOWERED: Chayka GRI 8000 doesn't satisfy USCG 9.9ms constraint!
+ * NOTE: Chayka GRI 8000 doesn't satisfy USCG 9.9ms constraint!
  *  Instead, TD difference is not smaller than ~8.5 ms in RSDN-3/10..
  */
 //#define LC_INT_99MS	(LC_FS * 99 / 10000)
@@ -300,7 +226,6 @@ extern size_t	lc_comb_delay[LC_COMB_KP_MAX+1];
 
 #define LC_PC_NCNT	4	/* "Normal" PC count */
 #define LC_PC_CNT	5	/* Overall PC count, including synthetic ones */
-
 /*
  * Phase codes themself
  * Values meaning: >0 - coefficient '+1', <0 - '-1', 0 - '0'
@@ -383,18 +308,12 @@ struct lc_station {
 	uint8_t		span_next;
 
 	/*
-	 * Sets to true when spanzone 0 begins being filled - passed FRIs are
-	 *  counted from this moment
+	 * Decremented on each FRI passed. When equals 0, resets to
+	 *  ssr_call_period and SSR is called
 	 */
-	_Bool		span0_open;
-
-	/* Number of FRIs passed "through" station (internal use) */
-	size_t		fris_passed;
-	/* Number of last passed-through GRI (internal use) */
-	size_t		last_gri_idx;
-	/* Period (FRIs count) to call station service routine with */
+	size_t		fri_counter;
+	/* Desired period (FRIs count) to call station service routine with */
 	size_t		ssr_call_period;
-
 
 	/* P to use for comb filter */
 	int		comb_kp;
@@ -442,10 +361,8 @@ struct lc_station {
 	_Bool		seek_complete;
 
 	/*** LOCKING related ***/
-	size_t		lock_point;
-	size_t		lock_pc;
-	_Bool		lock_enabled;
-	int32_t		pbegin_last;
+	int		locked_pc;
+	int		locking_counter;
 };
 
 /* Struct represents single Loran-C chain */

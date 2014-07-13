@@ -1,11 +1,14 @@
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <assert.h>
 #include <alloca.h>
 
+#include <stdio.h>
+
 #include "loran.h"
 #include "loran_reference.h"
+#include "util.h"
 
 /* Phase codes for GRI A and B */
 
@@ -50,8 +53,8 @@ void lc_init(struct lc_chain *chain)
 
 		sta->idx = i;
 		sta->offset = 0;
-		sta->fris_passed = 0;
-		sta->last_gri_idx = 0;
+		sta->ssr_call_period = 0;
+		sta->fri_counter = 0;
 		sta->state = LC_STAST_IDLE;
 
 		sta->comb_kp = 5;
@@ -83,6 +86,7 @@ void lc_init(struct lc_chain *chain)
 	       sizeof(struct lc_chain), sizeof(struct lc_station));
 
 	lc_calc_free_intervals(chain);
+	lc_calc_seek_ints(chain);
 	lc_start_seek(chain);
 }
 
@@ -119,7 +123,6 @@ static void lc_calc_spans(struct lc_chain *chain, struct lc_station *sta)
 	}
 
 	sta->span_next = 0;
-	sta->span0_open = 0;
 }
 
 /*
@@ -391,7 +394,7 @@ static void lc_select_candidates(struct lc_chain *chain)
 		if(cand->offset >= restr_end) {
 			/* Current candidate passes selection.. */
 			cand->passed = 1;
-			restr_end = off + LC_INT_99MS;
+			restr_end = cand->offset + LC_INT_99MS;
 		} else {
 			/* Doesn't pass - discard */
 			cand->passed = 0;
@@ -410,6 +413,122 @@ static void lc_select_candidates(struct lc_chain *chain)
 	}
 }
 
+/*
+ * Wipes all station windows and adds SSR delay needed to perform integration
+ */
+static inline void lc_sta_wipewin(struct lc_station *sta)
+{
+	/* Clear windows :3 */
+	memset(sta->win0, 0, sizeof(lc_type_comb_s) * LC_STA_WINSZ);
+	memset(sta->xcorr, 0,
+	       sizeof(lc_type_comb_s) * LC_STA_WINSZ * LC_PC_CNT);
+	memset(sta->xcorr_tmp, 0,
+	       sizeof(lc_type_data_s) * LC_STA_WINSZ * LC_PC_CNT);
+	/* Reinit FRI down-counter */
+	sta->fri_counter = LC_MAX(sta->ssr_call_period,
+				  lc_comb_delay[sta->comb_kp]);
+}
+
+/*
+ * Just moves station into new position, wiping windows and adding delay
+ */
+void lc_sta_reposition(struct lc_chain *chain, struct lc_station *sta,
+		       uint32_t newpos)
+{
+	assert(newpos < chain->grin);
+
+	sta->offset = newpos;
+	lc_calc_spans(chain, sta);
+	lc_sta_wipewin(sta);
+}
+
+/*
+ * "Intelligent" relative station movement: change current position by "shift"
+ *  and either wipe all windows and add delay (if shift is larger than
+ *  threshold), or move data in windows, probably exchanging complementary
+ *  phase code ones if station moves across GRI boundary.
+ *
+ *  Also swaps PC index to complementary one in condition described above
+ */
+void lc_sta_shift(struct lc_chain *chain, struct lc_station *sta, int32_t shift)
+{
+	assert(abs(shift) < (int32_t) chain->grin);
+
+	int32_t newpos = (int32_t) sta->offset + shift;
+	_Bool	swap_pc = 0;
+
+	if(newpos < 0) {
+		newpos+= (int32_t) chain->grin;
+		swap_pc = 1;
+	} else if(newpos >= (int32_t) chain->grin) {
+		newpos-= (int32_t) chain->grin;
+		swap_pc = 1;
+	}
+
+	assert(newpos >= 0 && newpos < (int32_t) chain->grin);
+
+	sta->offset = (uint32_t) newpos;
+	lc_calc_spans(chain, sta);
+
+	if(abs(shift) <= (int32_t) LC_STA_DFSHIFT) {
+		/* Small shift - move part of window*/
+		if(swap_pc) {
+			size_t scount = LC_STA_WINSZ - abs(shift);
+			/* Exchange PC correlation windows and shift */
+			memxchgshift(sta->xcorr[LC_PC_MASTER_A],
+				     sta->xcorr[LC_PC_MASTER_B],
+				     scount * sizeof(lc_type_comb_s),
+				     -shift * sizeof(lc_type_comb_s));
+			memxchgshift(sta->xcorr[LC_PC_SLAVE_A],
+				     sta->xcorr[LC_PC_SLAVE_B],
+				     scount * sizeof(lc_type_comb_s),
+				     -shift * sizeof(lc_type_comb_s));
+		} else {
+			for(size_t pc = 0; pc < LC_PC_NCNT; ++pc)
+				memshift(sta->xcorr[pc],
+					 LC_STA_WINSZ * sizeof(lc_type_comb_s),
+					 -shift * sizeof(lc_type_comb_s));
+		}
+		memshift(sta->xcorr[LC_PC_SYNTH],
+			 LC_STA_WINSZ * sizeof(lc_type_comb_s),
+			 -shift * sizeof(lc_type_comb_s));
+		memshift(sta->win0,
+			 LC_STA_WINSZ * sizeof(lc_type_comb_s),
+			 -shift * sizeof(lc_type_comb_s));
+		/* Wipe cross-correlation accumulator windows */
+		memset(sta->xcorr_tmp, 0,
+		       sizeof(lc_type_data_s) * LC_STA_WINSZ * LC_PC_CNT);
+		/* Reset FRI down-counter without delay */
+		sta->fri_counter = sta->ssr_call_period;
+	} else {
+		/* Too large shift - just wipe and add delay */
+		lc_sta_wipewin(sta);
+	}
+	/* Change LOCKING/TRACKING PC to opposite group: A-B, B-A */
+	if(swap_pc)
+		sta->locked_pc =(~sta->locked_pc & 0x1)|(sta->locked_pc & ~0x1);
+}
+
+/*
+ * Put station into LOCKING mode on given candidate position
+ */
+static void lc_start_locking(struct lc_chain *chain, struct lc_station *sta,
+			     struct lc_cand *cand)
+{
+	printf("STA %u LOCKING onto position %5u\n",
+	       sta->idx, cand->offset);
+
+	/* Call service routine every 10 FRIs to process gathered data */
+	sta->ssr_call_period = 10;
+	sta->locked_pc = cand->pc;
+	/* Move station */
+	sta->offset = cand->offset;
+	lc_sta_shift(chain, sta, -LC_WIN_CENTER);
+
+	/* Do at least 30 calls to SSR to complete LOCKING */
+	sta->locking_counter = 30;
+	sta->state = LC_STAST_LOCKING;
+}
 
 /*
  * Initiate seek process for all IDLE stations
@@ -418,8 +537,6 @@ static void lc_select_candidates(struct lc_chain *chain)
  */
 static void lc_start_seek(struct lc_chain *chain)
 {
-	lc_calc_seek_ints(chain);
-
 	chain->seek_sta_cnt = 0;
 
 	for(size_t i = 0; i < chain->station_cnt; ++i) {
@@ -427,7 +544,7 @@ static void lc_start_seek(struct lc_chain *chain)
 
 		assert(sta->state != LC_STAST_SEEK);
 
-		if(!LC_STA_IS_IDLE(sta))
+		if(LC_STA_IS_BUSY(sta))
 			continue;
 		if(!sta->seek_ints_cnt)
 			continue;
@@ -442,18 +559,12 @@ static void lc_start_seek(struct lc_chain *chain)
 		sta->seek_cur_int = &sta->seek_ints[0];
 		sta->seek_complete = 0;
 		sta->comb_kp = 6;	/* Default SEEK value */
-		sta->offset = sta->seek_cur_int->begin;
 
-		sta->fris_passed = 0;
-		sta->last_gri_idx = 0;
-		sta->ssr_call_period = lc_comb_delay[sta->comb_kp];
+		sta->ssr_call_period = 1;
 
-		sta->lock_enabled = 0;
+		lc_sta_reposition(chain, sta, sta->seek_cur_int->begin);
 
 		sta->state = LC_STAST_SEEK;
-
-		lc_calc_spans(chain, sta);
-
 		chain->seek_sta_cnt++;
 	}
 }
@@ -483,11 +594,39 @@ static void lc_seek_completed(struct lc_chain *chain)
 	 * Here we should assign tasks to IDLE stations and put them into
 	 * LOCKING state
 	 */
+	printf("PASSED:\n");
+	for(size_t i = 0; i < chain->seek_cand_cnt; ++i) {
+		if(!chain->seek_cand[i].passed)
+			continue;
+		printf("\t@ %5u: PC %u, ACC %6u\n",
+		       chain->seek_cand[i].offset, chain->seek_cand[i].pc,
+		       chain->seek_cand[i].accuracy);
+	}
+	size_t sidx = 0;
+	size_t cidx = 0;
+	while(cidx < chain->seek_cand_cnt && sidx < chain->station_cnt) {
+		/* Find next passed candidate */
+		while(cidx < chain->seek_cand_cnt &&
+		      !chain->seek_cand[cidx].passed)
+			cidx++;
+		if(cidx == chain->seek_cand_cnt)
+			break;
+		/* Find next IDLE station */
+		while(sidx < chain->station_cnt &&
+		      chain->sta[sidx].state != LC_STAST_IDLE)
+			sidx++;
+		if(sidx == chain->station_cnt)
+			break;
+		/* Put found station into LOCKING mode */
+		lc_start_locking(chain, &chain->sta[sidx],
+				 &chain->seek_cand[cidx]);
+		/* Go on to the next candidate */
+		cidx++;
+	}
 
 	lc_calc_free_intervals(chain);
 	lc_calc_seek_ints(chain);
-
-	assert(0);
+	lc_start_seek(chain);
 }
 
 /*******************************************************************************
@@ -497,7 +636,12 @@ static void lc_seek_completed(struct lc_chain *chain)
 static void lc_sta_service_locking(struct lc_chain *chain,
 				   struct lc_station *sta)
 {
-	assert(0);	/* Die */
+	printf("[[[BZzZZ]]] STA %u Offset %u\n", sta->idx, sta->offset);
+	lc_process_seek(chain, sta);
+	lc_sta_shift(chain, sta, 1);
+
+	sta->locking_counter--;
+	assert(sta->locking_counter);
 }
 
 /*
@@ -516,7 +660,7 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 	lc_process_seek(chain, sta);
 
 	/* Try to advance station offset */
-	size_t		new_offset;
+	uint32_t	new_offset;
 	new_offset = sta->offset + LC_STA_WINSHIFT;
 
 	if(new_offset >= sta->seek_cur_int->end) {
@@ -540,30 +684,12 @@ static void lc_sta_service_seek(struct lc_chain *chain, struct lc_station *sta)
 				lc_seek_completed(chain);
 			}
 
-//			if(sta->lock_enabled) {
-//				if(sta->lock_point < LC_STA_WINSHIFT)
-//					sta->offset = sta->lock_point + chain->grin - LC_STA_WINSHIFT;
-//				else
-//					sta->offset = sta->lock_point - LC_STA_WINSHIFT;
-//				sta->ssr_call_period = 1;
-//				sta->state = LC_STAST_LOCKING;
-//				printf("#LOCK# STA %d locking at %u\n",
-//				       sta - chain->sta, sta->offset);
-//			}
-
 			return;
 		}
 	}
 
-	/* Clear windows :3 */
-	memset(sta->win0, 0, sizeof(lc_type_comb_s) * LC_STA_WINSZ);
-	for(size_t i = 0; i < LC_PC_CNT; ++i)
-		memset(sta->xcorr[i], 0, sizeof(lc_type_comb_s) * LC_STA_WINSZ);
-
-	sta->fris_passed = 0;
 	sta->offset = new_offset;
-	lc_calc_spans(chain, sta);
-	sta->span_next = 0;
+	lc_sta_reposition(chain, sta, new_offset);
 }
 
 /*
@@ -587,6 +713,11 @@ static void lc_sta_service(struct lc_chain *chain, struct lc_station *sta)
 		break;
 	}
 }
+
+/*******************************************************************************
+ * Signal processing routines: take ADC samples and do the magic with them,
+ *  resulting in filtered signal and cross-correlatio output in station windows
+ */
 
 static void lc_sta_xcorr_tmp_filter(struct lc_station *sta)
 {
@@ -623,8 +754,6 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 	assert(win_idx < LC_STA_WINCNT);
 	assert(data_offset < LC_STA_WINSZ);
 
-//	printf("STA %u WINDOW %2u OFF %5u SIZE %4u\n",
-//	       sta->idx, win_idx, data_offset, count);
 	wptr = sta->win0 + data_offset;
 	data_end = data + count;
 
@@ -672,7 +801,7 @@ static void lc_win_new_samples(struct lc_station *sta, size_t win_idx,
 }
 
 /*
- * Handle samples targeted at particular station, at particular GRI window group
+ * Handle samples targeted at particular station, at particular spanzone
  *
  * Redirects these samples to individual windows...
  */
@@ -690,20 +819,12 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 
 	assert(data_offset + count <= sz->end - sz->begin);
 
-//	if(data_offset == 0 && sta->span_next == 0)
-//		sta->span0_open = 1;
-//	if(!sta->span0_open)
-//		return;
-
-//	printf("\nSTA %u SPANZONE %u OFF %5u SIZE %4u\n",
-//	       sta->idx,  sta->span_next, data_offset, count);
 	/* Here data_offset is offset from beginning of _spanzone_ */
 	win_offset = data_offset + sz->win_offset;
 	startw = win_offset / LC_STA_WININT;
 	win_offset-= startw * LC_STA_WININT;
 	assert(win_offset < LC_STA_WININT);
 	startw+= sz->win_idx;
-//	printf("\tSTARTW %u WOFF %u\n", startw, win_offset);
 	/*
 	 * Now win_offset is offset from beginning of _window_ startw,
 	 * and startw is first window that new data belongs to
@@ -733,10 +854,10 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 		if(sta->span_next == sta->spans_cnt - 1) {
 			sta->span_next = 0;
 			/*
-			 * Increment passed FRIs counter, cause we've just
+			 * Decrement FRIs counter, cause we've just
 			 * filled last spanzone
 			 */
-			sta->fris_passed++;
+			sta->fri_counter--;
 			/* Perform comb-filtering of gathered xcorr_tmp wins */
 			lc_sta_xcorr_tmp_filter(sta);
 		} else {
@@ -745,9 +866,9 @@ static void lc_sta_new_samples(struct lc_chain *chain, struct lc_station *sta,
 	}
 
 	/* Call SSR if enough FRIs have passed through */
-	if(sta->ssr_call_period && sta->fris_passed >= sta->ssr_call_period) {
+	if(sta->ssr_call_period && sta->fri_counter == 0) {
+		sta->fri_counter = sta->ssr_call_period;
 		lc_sta_service(chain, sta);
-		sta->fris_passed = 0;
 	}
 }
 
